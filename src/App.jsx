@@ -326,6 +326,28 @@ function timeAgo(iso) {
   return `${Math.round(h / 24)}d ago`;
 }
 
+// Remembers the live Drive connection (access token + which file, with the
+// token's own expiry) in sessionStorage, so refreshing the page resumes the
+// same session instead of forcing a full reconnect + reconciliation every
+// time. Cleared automatically once the token's actual expiry passes, and
+// whenever you close the tab (sessionStorage's normal behavior) or disconnect.
+const DRIVE_SESSION_KEY = "slate:driveSession";
+function saveDriveSession(token, expiresAt, fileId) {
+  try { window.sessionStorage.setItem(DRIVE_SESSION_KEY, JSON.stringify({ token, expiresAt, fileId })); } catch (e) { /* ignore */ }
+}
+function loadDriveSession() {
+  try {
+    const raw = window.sessionStorage.getItem(DRIVE_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed.token || !parsed.fileId || !parsed.expiresAt || Date.now() >= parsed.expiresAt - 30000) return null;
+    return parsed;
+  } catch (e) { return null; }
+}
+function clearDriveSession() {
+  try { window.sessionStorage.removeItem(DRIVE_SESSION_KEY); } catch (e) { /* ignore */ }
+}
+
 /* =================================== app =================================== */
 
 export default function App() {
@@ -363,8 +385,10 @@ export default function App() {
   // Google Drive sync
   const [drive, setDrive] = useState({ status: "disconnected", fileId: null, lastSyncedAt: null, error: null });
   const [driveModalOpen, setDriveModalOpen] = useState(false);
+  const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
   const [driveConflict, setDriveConflict] = useState(null); // {fileId, driveData, localPayload, token}
   const driveTokenRef = useRef(null);
+  const driveTokenExpiryRef = useRef(null);
   // the updatedAt string of the last version of the data we know Drive has —
   // whether because we just wrote it, or just pulled it. Lets the polling
   // check below tell "something changed elsewhere" apart from "I just wrote this myself"
@@ -571,6 +595,8 @@ export default function App() {
               return;
             }
             driveTokenRef.current = resp.access_token;
+            const expiresAt = Date.now() + (Number(resp.expires_in || 3600) * 1000);
+            driveTokenExpiryRef.current = expiresAt;
             await handleDriveConnected(resp.access_token);
           },
         });
@@ -658,6 +684,8 @@ export default function App() {
 
   function disconnectDrive() {
     driveTokenRef.current = null;
+    driveTokenExpiryRef.current = null;
+    clearDriveSession();
     setDrive({ status: "disconnected", fileId: null, lastSyncedAt: null, error: null });
     showToast("Disconnected — your data stays on this device only");
   }
@@ -683,27 +711,56 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, drive.status, drive.fileId]);
 
+  // remember this connection across a page refresh, so reloading resumes
+  // instead of forcing a full reconnect
+  useEffect(() => {
+    if (drive.status === "connected" && drive.fileId && driveTokenRef.current && driveTokenExpiryRef.current) {
+      saveDriveSession(driveTokenRef.current, driveTokenExpiryRef.current, drive.fileId);
+    }
+  }, [drive.status, drive.fileId]);
+
+  // on first load, silently resume a still-valid session from before a
+  // refresh — no reconnect click, no reconciliation, just pick up where
+  // things left off (the immediate poll right below catches up on anything
+  // that changed elsewhere during the reload gap)
+  useEffect(() => {
+    if (!ready) return;
+    const session = loadDriveSession();
+    if (session) {
+      driveTokenRef.current = session.token;
+      driveTokenExpiryRef.current = session.expiresAt;
+      lastKnownDriveUpdatedAtRef.current = null; // force the next poll to reconcile, rather than assume it's already in sync
+      setDrive({ status: "connected", fileId: session.fileId, lastSyncedAt: null, error: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
   // poll Drive every 15s for changes made from another device, so two open
   // devices actually catch up to each other without needing a manual
   // disconnect/reconnect. Skips applying anything that turns out to just be
-  // an echo of this device's own last push.
+  // an echo of this device's own last push. Also runs once immediately when
+  // a connection starts/resumes, so you're not waiting up to 15s to catch up.
   useEffect(() => {
     if (drive.status !== "connected" || !drive.fileId) return;
-    const id = setInterval(async () => {
+    let cancelled = false;
+    const poll = async (isInitial) => {
       if (!driveTokenRef.current) return;
       try {
         const data = await driveReadFile(driveTokenRef.current, drive.fileId);
+        if (cancelled) return;
         if (data && data.updatedAt && data.updatedAt !== lastKnownDriveUpdatedAtRef.current) {
           applyDriveData(data);
           lastKnownDriveUpdatedAtRef.current = data.updatedAt;
           setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() }));
-          showToast("Updated from another device");
+          if (!isInitial) showToast("Updated from another device");
         }
       } catch (e) {
-        setDrive(d => (d.status === "connected" ? { ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." } : d));
+        if (!cancelled) setDrive(d => (d.status === "connected" ? { ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." } : d));
       }
-    }, 15000);
-    return () => clearInterval(id);
+    };
+    poll(true);
+    const id = setInterval(() => poll(false), 15000);
+    return () => { cancelled = true; clearInterval(id); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drive.status, drive.fileId]);
 
@@ -741,26 +798,42 @@ export default function App() {
     return <div className="loading-screen">Loading your week…</div>;
   }
 
+  const sidebarProps = {
+    tasks: filteredTasks,
+    overdueIds: schedule.overdue,
+    unscheduledIds: schedule.unscheduled,
+    categoryFilter, setCategoryFilter,
+    search, setSearch,
+    showCompleted, setShowCompleted,
+    onAddTask: () => { setTaskModal("new"); setMobileTasksOpen(false); },
+    onEditTask: (t) => { setTaskModal(t); setMobileTasksOpen(false); },
+    onDeleteTask: deleteTask,
+    onToggleComplete: toggleComplete,
+    blockedEvents,
+    onAddBlocked: () => { setBlockedModal("new"); setMobileTasksOpen(false); },
+    onEditBlocked: (e) => { setBlockedModal(e); setMobileTasksOpen(false); },
+    onDeleteBlocked: deleteBlockedEvent,
+  };
+
   return (
     <div className="app">
       <style>{CSS}</style>
 
       <Sidebar
-        tasks={filteredTasks}
-        overdueIds={schedule.overdue}
-        unscheduledIds={schedule.unscheduled}
-        categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter}
-        search={search} setSearch={setSearch}
-        showCompleted={showCompleted} setShowCompleted={setShowCompleted}
-        onAddTask={() => setTaskModal("new")}
-        onEditTask={(t) => setTaskModal(t)}
-        onDeleteTask={deleteTask}
-        onToggleComplete={toggleComplete}
-        blockedEvents={blockedEvents}
-        onAddBlocked={() => setBlockedModal("new")}
-        onEditBlocked={(e) => setBlockedModal(e)}
-        onDeleteBlocked={deleteBlockedEvent}
+        {...sidebarProps}
       />
+
+      {mobileTasksOpen && (
+        <div className="mobile-drawer-backdrop" onClick={(e) => { if (e.target === e.currentTarget) setMobileTasksOpen(false); }}>
+          <div className="mobile-drawer">
+            <div className="mobile-drawer-head">
+              <span>Tasks & blocked time</span>
+              <button className="icon-btn small" onClick={() => setMobileTasksOpen(false)}><X size={16} /></button>
+            </div>
+            <Sidebar {...sidebarProps} />
+          </div>
+        </div>
+      )}
 
       <div className="main">
         <Header
@@ -776,6 +849,7 @@ export default function App() {
           onOpenReview={() => setReviewOpen(true)}
           driveStatus={drive.status}
           onOpenDrive={() => setDriveModalOpen(true)}
+          onOpenMobileTasks={() => setMobileTasksOpen(true)}
         />
         <CalendarGrid
           weekDays={weekDays}
@@ -860,7 +934,7 @@ export default function App() {
 
 /* ================================ header =================================== */
 
-function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTask, onUndo, canUndo, onOpenReview, driveStatus, onOpenDrive }) {
+function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTask, onUndo, canUndo, onOpenReview, driveStatus, onOpenDrive, onOpenMobileTasks }) {
   const first = weekDays[0], last = weekDays[6];
   const label = first.getMonth() === last.getMonth()
     ? `${MONTH_LABELS[first.getMonth()]} ${first.getDate()}–${last.getDate()}`
@@ -868,6 +942,9 @@ function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTa
   return (
     <div className="header">
       <div className="header-left">
+        <button className="mobile-tasks-btn" onClick={onOpenMobileTasks} title="Tasks & blocked time">
+          <CalendarDays size={16} />
+        </button>
         <div className="brand"><span className="brand-dot" />Slate</div>
         <div className="week-nav">
           <button className="icon-btn" onClick={onPrev}><ChevronLeft size={16} /></button>
@@ -1490,7 +1567,7 @@ function DriveSyncModal({ drive, onConnect, onDisconnect, onManualSync, onClose 
   return (
     <ModalShell title="Google Drive sync" onClose={onClose}>
       <div className="hint-text" style={{ marginBottom: 14 }}>
-        Keeps one JSON file, created by this app in your own Drive, in sync with your tasks, blocks, and hours. Connect the same account on another device to share the same schedule there — nothing else in your Drive is touched. Once connected, changes made on either device show up on the other within about 15 seconds, no need to reload.
+        Keeps one JSON file, created by this app in your own Drive, in sync with your tasks, blocks, and hours. Connect the same account on another device to share the same schedule there — nothing else in your Drive is touched. Once connected, changes made on either device show up on the other within about 15 seconds, no need to reload — and refreshing the page won't disconnect you either, it'll just pick back up.
       </div>
 
       {drive.status === "connected" && (
@@ -1590,18 +1667,20 @@ const CSS = `
 
 :root{
   --bg:#0A0C11; --bg-elevated:#10131A; --surface:#161A23; --surface-hover:#1D222D;
-  --border:#242A36; --text:#E8EAEF; --text-dim:#8A90A0; --text-faint:#565C6B;
+  --border:#242A36; --border-soft:rgba(255,255,255,0.05); --text:#E8EAEF; --text-dim:#8A90A0; --text-faint:#565C6B;
   --danger:#FF5C6C; --success:#4ADE80;
   --radius:12px;
 }
 *{box-sizing:border-box;}
+html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavior:none; background:#0A0C11;}
+#root{height:100%;}
 .app, .app *{font-family:'Inter',system-ui,sans-serif;}
 .app{
-  display:flex; width:100%; height:100vh; background:var(--bg); color:var(--text);
+  display:flex; width:100%; height:100vh; height:100dvh; background:var(--bg); color:var(--text);
   overflow:hidden;
 }
 .loading-screen{
-  width:100%; height:100vh; display:flex; align-items:center; justify-content:center;
+  width:100%; height:100vh; height:100dvh; display:flex; align-items:center; justify-content:center;
   background:var(--bg); color:var(--text-dim); font-family:'Inter',sans-serif; font-size:14px;
 }
 
@@ -1662,6 +1741,11 @@ const CSS = `
 .icon-btn.small{padding:4px;}
 .icon-btn.ghost{opacity:0; }
 .task-row:hover .icon-btn.ghost{opacity:1;}
+.mobile-tasks-btn{
+  background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer;
+  padding:7px; border-radius:9px; align-items:center; justify-content:center; flex-shrink:0;
+}
+.mobile-tasks-btn:active{background:var(--surface-hover);}
 
 .blocked-row{
   display:flex; align-items:center; gap:8px; padding:8px 6px; border-radius:10px; cursor:pointer; transition:background .15s;
@@ -1706,12 +1790,12 @@ const CSS = `
 
 /* ---------- calendar ---------- */
 .calendar-wrap{flex:1; overflow:hidden; background:var(--bg);}
-.calendar-scroll{height:100%; overflow-y:auto; overflow-x:auto;}
+.calendar-scroll{height:100%; overflow-y:auto; overflow-x:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;}
 .calendar-grid{display:grid; min-width:820px;}
 .gutter-header{position:sticky; top:0; z-index:5; background:var(--bg);}
 .day-header{
   position:sticky; top:0; z-index:5; background:var(--bg); text-align:center; padding:10px 4px 12px;
-  border-bottom:1px solid var(--border); border-left:1px solid var(--border);
+  border-bottom:1px solid var(--border); border-left:1px solid var(--border-soft);
 }
 .day-header-today .day-header-num{
   background:linear-gradient(135deg,#5B8DEF,#7B6EF6); color:#fff; box-shadow:0 0 12px rgba(91,141,239,0.5);
@@ -1721,11 +1805,11 @@ const CSS = `
   font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:14px; width:26px; height:26px; border-radius:50%;
   display:flex; align-items:center; justify-content:center; margin:0 auto; color:var(--text);
 }
-.gutter{position:relative; border-right:1px solid var(--border);}
+.gutter{position:relative; border-right:1px solid var(--border-soft);}
 .hour-mark{position:absolute; right:8px; transform:translateY(-50%); font-size:10.5px; color:var(--text-faint); font-variant-numeric:tabular-nums;}
-.day-col{position:relative; border-left:1px solid var(--border);}
+.day-col{position:relative; border-left:1px solid var(--border-soft);}
 .day-col-today{background:rgba(91,141,239,0.035);}
-.hour-line{position:absolute; left:0; right:0; height:1px; background:var(--border);}
+.hour-line{position:absolute; left:0; right:0; height:1px; background:var(--border-soft);}
 .now-line{position:absolute; left:0; right:0; height:2px; background:var(--danger); z-index:3;}
 .now-dot{position:absolute; left:-4px; top:-3px; width:8px; height:8px; border-radius:50%; background:var(--danger); box-shadow:0 0 8px rgba(255,92,108,0.8);}
 
@@ -1865,9 +1949,34 @@ const CSS = `
 
 @media (max-width: 820px){
   .app{flex-direction:column;}
-  .sidebar{width:100%; min-width:0; max-height:38vh; border-right:none; border-bottom:1px solid var(--border);}
+  .sidebar{display:none;} /* on mobile the sidebar only appears inside the drawer below */
   .header{padding:10px 12px;}
-  .header-left{gap:12px;}
+  .header-left{gap:10px;}
   .stat-pill{display:none;}
+  .mobile-tasks-btn{display:flex;}
+}
+.mobile-tasks-btn{display:none;}
+
+/* ---------- mobile tasks drawer ---------- */
+.mobile-drawer-backdrop{
+  position:fixed; inset:0; background:rgba(5,6,9,0.55); z-index:60;
+  display:flex; flex-direction:column; align-items:stretch;
+  animation:drawer-fade-in .15s ease-out;
+}
+@keyframes drawer-fade-in{from{opacity:0;} to{opacity:1;}}
+.mobile-drawer{
+  background:var(--bg-elevated); border-bottom:1px solid var(--border);
+  border-radius:0 0 18px 18px; box-shadow:0 20px 50px rgba(0,0,0,0.55);
+  max-height:82vh; display:flex; flex-direction:column; overflow:hidden;
+  animation:drawer-slide-down .2s ease-out;
+}
+@keyframes drawer-slide-down{from{transform:translateY(-12px); opacity:0;} to{transform:translateY(0); opacity:1;}}
+.mobile-drawer-head{
+  display:flex; align-items:center; justify-content:space-between; padding:14px 16px;
+  border-bottom:1px solid var(--border); font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:14.5px;
+  flex-shrink:0;
+}
+.mobile-drawer .sidebar{
+  display:flex; width:100%; min-width:0; max-height:none; border-right:none; padding:12px 14px 20px; flex:1; overflow-y:auto;
 }
 `;
