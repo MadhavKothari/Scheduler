@@ -1,0 +1,14 @@
+{
+  "name": "Slate — Time Blocking",
+  "short_name": "Slate",
+  "description": "A time-blocking scheduler that plans your week around your work and private hours.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0A0C11",
+  "theme_color": "#0A0C11",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
