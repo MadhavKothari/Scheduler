@@ -365,6 +365,10 @@ export default function App() {
   const [driveModalOpen, setDriveModalOpen] = useState(false);
   const [driveConflict, setDriveConflict] = useState(null); // {fileId, driveData, localPayload, token}
   const driveTokenRef = useRef(null);
+  // the updatedAt string of the last version of the data we know Drive has —
+  // whether because we just wrote it, or just pulled it. Lets the polling
+  // check below tell "something changed elsewhere" apart from "I just wrote this myself"
+  const lastKnownDriveUpdatedAtRef = useRef(null);
 
   // tracks whether THIS device has ever had real (non-default) data typed
   // into it, and when it was actually last changed — used to tell a fresh
@@ -582,6 +586,7 @@ export default function App() {
 
       if (!file) {
         file = await driveCreateFile(token, localPayload);
+        lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
         return;
@@ -593,6 +598,7 @@ export default function App() {
       if (!driveHasData) {
         // Drive file exists but is empty/blank — nothing to lose, just push this device's data
         await driveWriteFile(token, file.id, localPayload);
+        lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
         return;
@@ -602,6 +608,7 @@ export default function App() {
         // this device has nothing of its own worth keeping yet (still just the
         // starter tasks, or truly untouched) — adopt Drive's real schedule, no prompt needed
         applyDriveData(driveData);
+        lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Loaded your schedule from Drive");
         return;
@@ -613,6 +620,7 @@ export default function App() {
         JSON.stringify(driveData.completionLog) === JSON.stringify(localPayload.completionLog);
 
       if (sameContent) {
+        lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Already in sync with Drive");
         return;
@@ -633,11 +641,16 @@ export default function App() {
       showToast("Connection cancelled — nothing was changed");
     } else if (choice === "drive") {
       applyDriveData(driveData);
+      lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
       setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null });
       showToast("Loaded the version from Drive");
     } else {
       driveWriteFile(token, fileId, localPayload)
-        .then(() => { setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null }); showToast("Pushed this device's schedule to Drive"); })
+        .then(() => {
+          lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
+          setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null });
+          showToast("Pushed this device's schedule to Drive");
+        })
         .catch(e => setDrive(d => ({ ...d, status: "error", error: e.message })));
     }
     setDriveConflict(null);
@@ -651,8 +664,9 @@ export default function App() {
 
   function manualSyncDrive() {
     if (drive.status !== "connected" || !driveTokenRef.current || !drive.fileId) return;
-    driveWriteFile(driveTokenRef.current, drive.fileId, buildSyncPayload())
-      .then(() => { setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); showToast("Synced to Drive"); })
+    const payload = buildSyncPayload();
+    driveWriteFile(driveTokenRef.current, drive.fileId, payload)
+      .then(() => { lastKnownDriveUpdatedAtRef.current = payload.updatedAt; setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); showToast("Synced to Drive"); })
       .catch(() => { setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })); showToast("Drive sync failed — reconnect to keep going"); });
   }
 
@@ -660,13 +674,38 @@ export default function App() {
   useEffect(() => {
     if (drive.status !== "connected" || !driveTokenRef.current || !drive.fileId) return;
     const t = setTimeout(() => {
-      driveWriteFile(driveTokenRef.current, drive.fileId, buildSyncPayload())
-        .then(() => setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })))
+      const payload = buildSyncPayload();
+      driveWriteFile(driveTokenRef.current, drive.fileId, payload)
+        .then(() => { lastKnownDriveUpdatedAtRef.current = payload.updatedAt; setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); })
         .catch(() => { setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })); showToast("Drive sync paused — reconnect to keep going"); });
     }, 2000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, drive.status, drive.fileId]);
+
+  // poll Drive every 15s for changes made from another device, so two open
+  // devices actually catch up to each other without needing a manual
+  // disconnect/reconnect. Skips applying anything that turns out to just be
+  // an echo of this device's own last push.
+  useEffect(() => {
+    if (drive.status !== "connected" || !drive.fileId) return;
+    const id = setInterval(async () => {
+      if (!driveTokenRef.current) return;
+      try {
+        const data = await driveReadFile(driveTokenRef.current, drive.fileId);
+        if (data && data.updatedAt && data.updatedAt !== lastKnownDriveUpdatedAtRef.current) {
+          applyDriveData(data);
+          lastKnownDriveUpdatedAtRef.current = data.updatedAt;
+          setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() }));
+          showToast("Updated from another device");
+        }
+      } catch (e) {
+        setDrive(d => (d.status === "connected" ? { ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." } : d));
+      }
+    }, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drive.status, drive.fileId]);
 
   const weekStart = addDays(startOfDay(now), weekStartOffset);
   const weekDays = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
@@ -1451,7 +1490,7 @@ function DriveSyncModal({ drive, onConnect, onDisconnect, onManualSync, onClose 
   return (
     <ModalShell title="Google Drive sync" onClose={onClose}>
       <div className="hint-text" style={{ marginBottom: 14 }}>
-        Keeps one JSON file, created by this app in your own Drive, in sync with your tasks, blocks, and hours. Connect the same account on another device to share the same schedule there — nothing else in your Drive is touched.
+        Keeps one JSON file, created by this app in your own Drive, in sync with your tasks, blocks, and hours. Connect the same account on another device to share the same schedule there — nothing else in your Drive is touched. Once connected, changes made on either device show up on the other within about 15 seconds, no need to reload.
       </div>
 
       {drive.status === "connected" && (
