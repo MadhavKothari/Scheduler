@@ -1624,7 +1624,7 @@ function DriveConflictModal({ conflict, localUpdatedAt, onResolve }) {
   return (
     <ModalShell title="Two schedules found" onClose={() => onResolve("cancel")}>
       <div className="hint-text" style={{ marginBottom: 16 }}>
-        Drive already has a saved schedule that's different from what's on this device. Nothing changes until you pick one — closing this without choosing just cancels the connection.
+        Drive already has a saved schedule that's different from what's on this device. Nothing changes until you pick one — closing this without choosing just cancels the connection, nothing is touched.
       </div>
       <div className="conflict-compare">
         <div className="conflict-side">
@@ -1637,8 +1637,8 @@ function DriveConflictModal({ conflict, localUpdatedAt, onResolve }) {
         </div>
       </div>
       <div className="modal-actions" style={{ justifyContent: "space-between" }}>
-        <button className="secondary-btn" onClick={() => onResolve("local")}>Keep this device's data</button>
-        <button className="primary-btn" onClick={() => onResolve("drive")}>Load from Drive</button>
+        <button className="secondary-btn" onClick={() => onResolve("local")}>Erase Drive, use this device</button>
+        <button className="primary-btn" onClick={() => onResolve("drive")}>Erase this device, use Drive</button>
       </div>
     </ModalShell>
   );
@@ -1757,7 +1757,7 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 .blocked-sub{font-size:11px; color:var(--text-faint); margin-top:2px;}
 
 /* ---------- main / header ---------- */
-.main{flex:1; display:flex; flex-direction:column; min-width:0;}
+.main{flex:1; display:flex; flex-direction:column; min-width:0; min-height:0;}
 .header{
   display:flex; align-items:center; justify-content:space-between; padding:14px 20px;
   border-bottom:1px solid var(--border); background:var(--bg-elevated);
@@ -1789,7 +1789,7 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 .secondary-btn:hover{background:var(--surface-hover);}
 
 /* ---------- calendar ---------- */
-.calendar-wrap{flex:1; overflow:hidden; background:var(--bg);}
+.calendar-wrap{flex:1; overflow:hidden; background:var(--bg); min-height:0;}
 .calendar-scroll{height:100%; overflow-y:auto; overflow-x:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;}
 .calendar-grid{display:grid; min-width:820px;}
 .gutter-header{position:sticky; top:0; z-index:5; background:var(--bg);}
@@ -1977,6 +1977,6 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
   flex-shrink:0;
 }
 .mobile-drawer .sidebar{
-  display:flex; width:100%; min-width:0; max-height:none; border-right:none; padding:12px 14px 20px; flex:1; overflow-y:auto;
+  display:flex; width:100%; min-width:0; min-height:0; max-height:none; border-right:none; padding:12px 14px 20px; flex:1; overflow-y:auto;
 }
 `;
