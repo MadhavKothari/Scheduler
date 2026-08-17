@@ -366,16 +366,25 @@ export default function App() {
   const [driveConflict, setDriveConflict] = useState(null); // {fileId, driveData, localPayload, token}
   const driveTokenRef = useRef(null);
 
+  // tracks whether THIS device has ever had real (non-default) data typed
+  // into it, and when it was actually last changed — used to tell a fresh
+  // device apart from one with real edits worth protecting during sync
+  const [hasLocalEdits, setHasLocalEdits] = useState(false);
+  const [localUpdatedAt, setLocalUpdatedAt] = useState(null);
+  const skipNextEditMarkRef = useRef(true);
+
   /* ---- load once ---- */
   useEffect(() => {
     (async () => {
-      const [t, be, lb, wr, pr, cl] = await Promise.all([
+      const [t, be, lb, wr, pr, cl, hle, lua] = await Promise.all([
         loadKey("tasks", null),
         loadKey("blockedEvents", null),
         loadKey("lockedBlocks", null),
         loadKey("workRanges", null),
         loadKey("privateRanges", null),
         loadKey("completionLog", null),
+        loadKey("hasLocalEdits", false),
+        loadKey("localUpdatedAt", null),
       ]);
       setTasks(t || seedTasks());
       setBlockedEvents(be || seedBlockedEvents());
@@ -383,6 +392,8 @@ export default function App() {
       setWorkRanges(wr || seedWorkRanges());
       setPrivateRanges(pr || seedPrivateRanges());
       setCompletionLog(cl || []);
+      setHasLocalEdits(hle);
+      setLocalUpdatedAt(lua);
       setReady(true);
     })();
   }, []);
@@ -394,6 +405,19 @@ export default function App() {
   useEffect(() => { if (ready) saveKey("workRanges", workRanges); }, [workRanges, ready]);
   useEffect(() => { if (ready) saveKey("privateRanges", privateRanges); }, [privateRanges, ready]);
   useEffect(() => { if (ready) saveKey("completionLog", completionLog); }, [completionLog, ready]);
+  useEffect(() => { if (ready) saveKey("hasLocalEdits", hasLocalEdits); }, [hasLocalEdits, ready]);
+  useEffect(() => { if (ready) saveKey("localUpdatedAt", localUpdatedAt); }, [localUpdatedAt, ready]);
+
+  // marks this device as having "real" data worth protecting during sync,
+  // and records exactly when it actually changed — but skips the very first
+  // run right after loading, so simply opening the app doesn't count as an edit
+  useEffect(() => {
+    if (!ready) return;
+    if (skipNextEditMarkRef.current) { skipNextEditMarkRef.current = false; return; }
+    setHasLocalEdits(true);
+    setLocalUpdatedAt(new Date().toISOString());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, ready]);
 
   /* ---- undo keyboard shortcut (Ctrl/Cmd+Z) ---- */
   useEffect(() => {
@@ -555,28 +579,48 @@ export default function App() {
     try {
       let file = await driveFindFile(token);
       const localPayload = buildSyncPayload();
+
       if (!file) {
         file = await driveCreateFile(token, localPayload);
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
         return;
       }
+
       const driveData = await driveReadFile(token, file.id);
       const driveHasData = driveData && Array.isArray(driveData.tasks) && driveData.tasks.length > 0;
-      const driveTime = driveData?.updatedAt ? new Date(driveData.updatedAt).getTime() : 0;
-      const localTime = new Date(localPayload.updatedAt).getTime();
-      if (driveHasData && Math.abs(driveTime - localTime) > 60000) {
-        setDriveConflict({ fileId: file.id, driveData, localPayload, token });
-        setDrive(d => ({ ...d, status: "connecting" }));
-      } else if (driveHasData) {
-        applyDriveData(driveData);
-        setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
-        showToast("Loaded your schedule from Drive");
-      } else {
+
+      if (!driveHasData) {
+        // Drive file exists but is empty/blank — nothing to lose, just push this device's data
         await driveWriteFile(token, file.id, localPayload);
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
+        return;
       }
+
+      if (!hasLocalEdits) {
+        // this device has nothing of its own worth keeping yet (still just the
+        // starter tasks, or truly untouched) — adopt Drive's real schedule, no prompt needed
+        applyDriveData(driveData);
+        setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
+        showToast("Loaded your schedule from Drive");
+        return;
+      }
+
+      const sameContent =
+        JSON.stringify(driveData.tasks) === JSON.stringify(localPayload.tasks) &&
+        JSON.stringify(driveData.blockedEvents) === JSON.stringify(localPayload.blockedEvents) &&
+        JSON.stringify(driveData.completionLog) === JSON.stringify(localPayload.completionLog);
+
+      if (sameContent) {
+        setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
+        showToast("Already in sync with Drive");
+        return;
+      }
+
+      // both sides have real, different data — let the person choose, rather than guessing
+      setDriveConflict({ fileId: file.id, driveData, localPayload, token });
+      setDrive(d => ({ ...d, status: "connecting" }));
     } catch (e) {
       setDrive(d => ({ ...d, status: "error", error: e.message }));
     }
@@ -584,7 +628,10 @@ export default function App() {
 
   function resolveDriveConflict(choice) {
     const { fileId, driveData, localPayload, token } = driveConflict;
-    if (choice === "drive") {
+    if (choice === "cancel") {
+      setDrive({ status: "disconnected", fileId: null, lastSyncedAt: null, error: null });
+      showToast("Connection cancelled — nothing was changed");
+    } else if (choice === "drive") {
       applyDriveData(driveData);
       setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null });
       showToast("Loaded the version from Drive");
@@ -606,7 +653,7 @@ export default function App() {
     if (drive.status !== "connected" || !driveTokenRef.current || !drive.fileId) return;
     driveWriteFile(driveTokenRef.current, drive.fileId, buildSyncPayload())
       .then(() => { setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); showToast("Synced to Drive"); })
-      .catch(e => setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })));
+      .catch(() => { setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })); showToast("Drive sync failed — reconnect to keep going"); });
   }
 
   // auto-push to Drive a couple seconds after any change, once connected
@@ -615,7 +662,7 @@ export default function App() {
     const t = setTimeout(() => {
       driveWriteFile(driveTokenRef.current, drive.fileId, buildSyncPayload())
         .then(() => setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })))
-        .catch(() => setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })));
+        .catch(() => { setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })); showToast("Drive sync paused — reconnect to keep going"); });
     }, 2000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -764,7 +811,7 @@ export default function App() {
       )}
 
       {driveConflict && (
-        <DriveConflictModal onResolve={resolveDriveConflict} />
+        <DriveConflictModal conflict={driveConflict} localUpdatedAt={localUpdatedAt} onResolve={resolveDriveConflict} />
       )}
 
       {toast && <div className="toast">{toast}</div>}
@@ -1453,11 +1500,25 @@ function DriveSyncModal({ drive, onConnect, onDisconnect, onManualSync, onClose 
   );
 }
 
-function DriveConflictModal({ onResolve }) {
+function DriveConflictModal({ conflict, localUpdatedAt, onResolve }) {
+  const driveCount = conflict.driveData?.tasks?.length ?? 0;
+  const localCount = conflict.localPayload?.tasks?.length ?? 0;
+  const driveWhen = conflict.driveData?.updatedAt ? timeAgo(conflict.driveData.updatedAt) : "unknown";
+  const localWhen = localUpdatedAt ? timeAgo(localUpdatedAt) : "just now";
   return (
-    <ModalShell title="Two schedules found" onClose={() => onResolve("local")}>
+    <ModalShell title="Two schedules found" onClose={() => onResolve("cancel")}>
       <div className="hint-text" style={{ marginBottom: 16 }}>
-        Drive already has a saved schedule that's different from what's on this device. Which one should win? The other will be overwritten.
+        Drive already has a saved schedule that's different from what's on this device. Nothing changes until you pick one — closing this without choosing just cancels the connection.
+      </div>
+      <div className="conflict-compare">
+        <div className="conflict-side">
+          <div className="conflict-side-title">This device</div>
+          <div className="conflict-side-meta">{localCount} tasks · edited {localWhen}</div>
+        </div>
+        <div className="conflict-side">
+          <div className="conflict-side-title">Google Drive</div>
+          <div className="conflict-side-meta">{driveCount} tasks · edited {driveWhen}</div>
+        </div>
       </div>
       <div className="modal-actions" style={{ justifyContent: "space-between" }}>
         <button className="secondary-btn" onClick={() => onResolve("local")}>Keep this device's data</button>
@@ -1748,6 +1809,10 @@ const CSS = `
 .drive-status{display:flex; align-items:center; gap:7px; font-size:12.5px; padding:9px 11px; border-radius:9px; background:var(--surface); border:1px solid var(--border);}
 .drive-status-ok{color:var(--success); border-color:#1f4a34;}
 .drive-status-warn{color:#FFB86B; border-color:#4a3a20;}
+.conflict-compare{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:16px;}
+.conflict-side{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:10px 12px;}
+.conflict-side-title{font-size:11.5px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.03em; margin-bottom:4px;}
+.conflict-side-meta{font-size:12.5px; color:var(--text);}
 .setup-steps{margin:8px 0 0; padding-left:18px; font-size:11.5px; color:var(--text-faint); line-height:1.7;}
 .setup-steps code{background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--text-dim); font-size:11px;}
 @media (max-width: 820px){
