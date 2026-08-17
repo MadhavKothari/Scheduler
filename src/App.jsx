@@ -1947,6 +1947,8 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 .sidebar-scroll::-webkit-scrollbar, .calendar-scroll::-webkit-scrollbar, .modal::-webkit-scrollbar{width:8px; height:8px;}
 .sidebar-scroll::-webkit-scrollbar-thumb, .calendar-scroll::-webkit-scrollbar-thumb, .modal::-webkit-scrollbar-thumb{background:#2a2f3b; border-radius:8px;}
 
+.mobile-tasks-btn{display:none;}
+
 @media (max-width: 820px){
   .app{flex-direction:column;}
   .sidebar{display:none;} /* on mobile the sidebar only appears inside the drawer below */
@@ -1955,7 +1957,6 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
   .stat-pill{display:none;}
   .mobile-tasks-btn{display:flex;}
 }
-.mobile-tasks-btn{display:none;}
 
 /* ---------- mobile tasks drawer ---------- */
 .mobile-drawer-backdrop{
