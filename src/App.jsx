@@ -250,6 +250,11 @@ async function saveKey(key, value) {
  * work inside a sandboxed in-chat preview.
  */
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+// Bumped by hand on every meaningful code change, and shown in the Drive
+// sync panel — a quick way to confirm a device is actually running the
+// latest deployed build rather than something stale a service worker or
+// browser cache is still hanging onto.
+const BUILD_TAG = "2026.08.17-9";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -1612,6 +1617,7 @@ function DriveSyncModal({ drive, onConnect, onDisconnect, onManualSync, onClose 
         <li>Add that Client ID as the <code>VITE_GOOGLE_CLIENT_ID</code> secret in your GitHub repo, then redeploy — see the README for exact steps.</li>
       </ol>
       <div className="hint-text">This only works once the app is running at a real, fixed URL — Google won't grant access to a sandboxed preview link.</div>
+      <div className="build-tag">Build {BUILD_TAG}</div>
     </ModalShell>
   );
 }
@@ -1938,6 +1944,7 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 .conflict-side-meta{font-size:12.5px; color:var(--text);}
 .setup-steps{margin:8px 0 0; padding-left:18px; font-size:11.5px; color:var(--text-faint); line-height:1.7;}
 .setup-steps code{background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--text-dim); font-size:11px;}
+.build-tag{margin-top:14px; font-size:10.5px; color:var(--text-faint); text-align:center; font-variant-numeric:tabular-nums;}
 @media (max-width: 820px){
   .review-stats-row{grid-template-columns:repeat(2,1fr);}
   .review-two-col{grid-template-columns:1fr;}
