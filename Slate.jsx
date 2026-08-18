@@ -59,6 +59,19 @@ function formatDuration(mins) {
   return `${h}h ${m}m`;
 }
 function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+/* short "Due Thu" / "Due 15th" / "Due last day" chip text for a repeating
+   task with a pinned repeatDueRule, or null if it's left flexible */
+function repeatDueLabel(task) {
+  if (task.repeat === "weekly" && task.repeatDueRule != null) return `Due ${DAY_LABELS[task.repeatDueRule]}`;
+  if (task.repeat === "monthly" && task.repeatDueRule != null) {
+    return task.repeatDueRule === -1 ? "Due last day" : `Due ${ordinal(task.repeatDueRule)}`;
+  }
+  return null;
+}
 
 /* helper: which weekday's ranges apply to a day, based on category hour settings */
 function rangesForDay(day, rangesByWeekday) {
@@ -81,13 +94,85 @@ function subtractBusy(freeRanges, busy) {
   return result;
 }
 
-/* next due date after completing a repeating task */
-function nextOccurrence(fromDate, freq) {
-  const base = fromDate ? new Date(fromDate) : new Date();
-  if (freq === "daily") return addDays(base, 1);
-  if (freq === "weekly") return addDays(base, 7);
-  if (freq === "monthly") return addMonthsSafe(base, 1);
-  return null;
+function dayKey(d) { return startOfDay(d).toISOString().slice(0, 10); }
+
+/* number of days in a given month (month is 0-indexed, matches Date's getMonth()) */
+function daysInMonth(year, month) { return new Date(year, month + 1, 0).getDate(); }
+
+/**
+ * The period windows a repeating task should get a fresh, independent
+ * occurrence for within [today, today+horizonDays) — one per day for
+ * "daily", one per week for "weekly", one per month for "monthly". Each
+ * period gets its own occurrenceKey so it can be completed, dragged, or
+ * left unscheduled independently of every other period.
+ *
+ * `dueRule` optionally pins the period's deadline to a specific day instead
+ * of just "whenever the period happens to end":
+ *   - weekly:  dueRule is a weekday number, 0 (Sun) .. 6 (Sat)
+ *   - monthly: dueRule is a day-of-month, 1..31, or -1 for "last day of month"
+ * When dueRule is null/undefined the task is "flexible" and keeps the
+ * original rolling-window behavior (period end = the deadline, wherever
+ * that happens to fall relative to today).
+ */
+function periodsFor(repeat, today, horizonDays, dueRule) {
+  const periods = [];
+  const horizonEnd = addDays(today, horizonDays);
+  if (repeat === "daily") {
+    for (let i = 0; i < horizonDays; i++) {
+      const start = addDays(today, i);
+      periods.push({ start, end: addDays(start, 1), key: `d:${dayKey(start)}` });
+    }
+  } else if (repeat === "weekly") {
+    if (dueRule == null) {
+      for (let i = 0; i < horizonDays; i += 7) {
+        const start = addDays(today, i);
+        periods.push({ start, end: addDays(start, 7), key: `w:${dayKey(start)}` });
+      }
+    } else {
+      // periods run from the day after one due-weekday to the next due-weekday
+      // (inclusive), so "due every Thursday" gives each week a real Thursday
+      // deadline instead of an arbitrary 7-day-from-today window.
+      let periodStart = today, guard = 0;
+      while (periodStart < horizonEnd && guard < 30) {
+        const diff = (dueRule - periodStart.getDay() + 7) % 7;
+        const due = addDays(periodStart, diff);
+        periods.push({ start: periodStart, end: addDays(due, 1), key: `w:${dayKey(due)}` });
+        periodStart = addDays(due, 1);
+        guard++;
+      }
+    }
+  } else if (repeat === "monthly") {
+    if (dueRule == null) {
+      let start = today, guard = 0;
+      while (start < horizonEnd && guard < 12) {
+        const end = addMonthsSafe(start, 1);
+        periods.push({ start, end, key: `m:${dayKey(start)}` });
+        start = end;
+        guard++;
+      }
+    } else {
+      // periods run from the day after one due-day-of-month to the next
+      // (inclusive), so "due the 15th" gives each month a real 15th deadline;
+      // short months clamp to their last day (or dueRule === -1 always means
+      // "the last day of the month", whatever that is).
+      let periodStart = today, guard = 0;
+      while (periodStart < horizonEnd && guard < 12) {
+        const y = periodStart.getFullYear(), m = periodStart.getMonth();
+        const dim = daysInMonth(y, m);
+        const targetDay = dueRule === -1 ? dim : Math.min(dueRule, dim);
+        let due = new Date(y, m, targetDay);
+        if (due < periodStart) {
+          const nm = m + 1, ny = y + Math.floor(nm / 12), nmi = ((nm % 12) + 12) % 12;
+          const dim2 = daysInMonth(ny, nmi);
+          due = new Date(ny, nmi, dueRule === -1 ? dim2 : Math.min(dueRule, dim2));
+        }
+        periods.push({ start: periodStart, end: addDays(due, 1), key: `m:${dayKey(due)}` });
+        periodStart = addDays(due, 1);
+        guard++;
+      }
+    }
+  }
+  return periods;
 }
 
 /* ============================ scheduling engine ========================== */
@@ -103,8 +188,9 @@ function nextOccurrence(fromDate, freq) {
  *   trying slots after the due date (within the horizon) and flags it
  *   "overdue" so the UI can call it out.
  */
-function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK }) {
+function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges }) {
   const today = startOfDay(new Date());
+  const doneSet = new Set(completedOccurrences || []);
 
   const expandedBlocked = [];
   for (const be of blockedEvents) {
@@ -133,17 +219,36 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
     }
   }
 
+  // build one instance per task (non-repeating) or one per period within the
+  // horizon (repeating) — each independently schedulable, lockable, and
+  // completable, so a daily task actually gets a fresh block every day
+  // instead of a single occurrence for the whole week.
   const instances = [];
   for (const t of tasks) {
-    if (t.completed) continue;
-    const lockedForTask = lockedBlocks.filter(b => b.taskId === t.id);
-    const lockedMinutes = lockedForTask.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
-    const remaining = Math.max(0, t.duration - lockedMinutes);
-    if (remaining <= 0) continue;
-    instances.push({
-      taskId: t.id, name: t.name, category: t.category, priority: t.priority,
-      due: t.dueDate ? new Date(t.dueDate) : null, remaining,
-    });
+    if (t.repeat === "none" || !t.repeat) {
+      if (t.completed) continue;
+      const lockedForOcc = lockedBlocks.filter(b => b.taskId === t.id && !b.occurrenceKey);
+      const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
+      const remaining = Math.max(0, t.duration - lockedMinutes);
+      if (remaining <= 0) continue;
+      instances.push({
+        taskId: t.id, occurrenceKey: null, name: t.name, category: t.category, priority: t.priority,
+        due: t.dueDate ? new Date(t.dueDate) : null, remaining,
+      });
+    } else {
+      for (const p of periodsFor(t.repeat, today, horizonDays, t.repeatDueRule)) {
+        const occurrenceKey = `${t.id}::${p.key}`;
+        if (doneSet.has(occurrenceKey)) continue;
+        const lockedForOcc = lockedBlocks.filter(b => b.occurrenceKey === occurrenceKey);
+        const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
+        const remaining = Math.max(0, t.duration - lockedMinutes);
+        if (remaining <= 0) continue;
+        instances.push({
+          taskId: t.id, occurrenceKey, name: t.name, category: t.category, priority: t.priority,
+          due: p.end, periodStart: p.start, remaining,
+        });
+      }
+    }
   }
 
   instances.sort((a, b) => {
@@ -161,10 +266,24 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
 
   for (const inst of instances) {
     let remaining = inst.remaining;
-    const dueIdx = inst.due ? Math.floor((startOfDay(inst.due) - today) / (24 * 60 * MIN_MS)) : horizonDays - 1;
+    const startIdx = inst.periodStart ? Math.max(0, Math.floor((startOfDay(inst.periodStart) - today) / (24 * 60 * MIN_MS))) : 0;
+    // `due` marks the EXCLUSIVE end of a recurring instance's period (e.g. a
+    // daily period's due is midnight of the *next* day) — convert that to the
+    // last day index actually inside the period, or the loop below would
+    // wrongly reach one day past it (this is what let a Sunday occurrence
+    // spill over onto Monday).
+    const dueIdx = inst.periodStart
+      ? startIdx + Math.round((inst.due - inst.periodStart) / (24 * 60 * MIN_MS)) - 1
+      : (inst.due ? Math.floor((startOfDay(inst.due) - today) / (24 * 60 * MIN_MS)) : horizonDays - 1);
+    // recurring occurrences stay within their own day/week/month — if a given
+    // day has no room (e.g. a work task on a day with no work hours), that
+    // day's instance is simply missed rather than piling onto a later day.
+    // Non-repeating tasks still get the "search after the due date" fallback,
+    // since finishing a one-off task late generally beats not at all.
+    const maxPass = inst.occurrenceKey ? 1 : 2;
     let segIndex = 0;
-    for (let pass = 0; pass < 2 && remaining > 0; pass++) {
-      const startI = pass === 0 ? 0 : Math.max(0, dueIdx + 1);
+    for (let pass = 0; pass < maxPass && remaining > 0; pass++) {
+      const startI = pass === 0 ? startIdx : Math.max(startIdx, dueIdx + 1);
       const endI = pass === 0 ? Math.min(dueIdx, horizonDays - 1) : horizonDays - 1;
       if (startI > endI) continue;
       for (let i = startI; i <= endI && remaining > 0; i++) {
@@ -179,8 +298,8 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
           const blockEnd = addMinutes(blockStart, take);
           segIndex += 1;
           autoBlocks.push({
-            id: `auto-${inst.taskId}-${blockStart.getTime()}`,
-            taskId: inst.taskId, name: inst.name, category: inst.category,
+            id: `auto-${inst.taskId}-${inst.occurrenceKey || "x"}-${blockStart.getTime()}`,
+            taskId: inst.taskId, occurrenceKey: inst.occurrenceKey, name: inst.name, category: inst.category,
             start: blockStart, end: blockEnd, locked: false, segIndex,
           });
           remaining -= take;
@@ -192,10 +311,14 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
     if (remaining > 0) unscheduled.add(inst.taskId);
   }
 
-  // total segment counts, filled in after the fact
-  const totalByTask = {};
-  for (const b of autoBlocks) totalByTask[b.taskId] = (totalByTask[b.taskId] || 0) + 1;
-  for (const b of autoBlocks) b.segTotal = totalByTask[b.taskId];
+  // total segment counts, grouped per occurrence (so each day of a daily
+  // task counts its own segments, rather than lumping the whole week together)
+  const totalByGroup = {};
+  for (const b of autoBlocks) {
+    const g = b.occurrenceKey || b.taskId;
+    totalByGroup[g] = (totalByGroup[g] || 0) + 1;
+  }
+  for (const b of autoBlocks) b.segTotal = totalByGroup[b.occurrenceKey || b.taskId];
 
   return { autoBlocks, expandedBlocked, overdue: [...overdue], unscheduled: [...unscheduled] };
 }
@@ -205,11 +328,11 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
 function seedTasks() {
   const today = startOfDay(new Date());
   return [
-    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", repeatDueRule: 4, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", repeatDueRule: null, completed: false, lastCompletedAt: null },
   ];
 }
 function seedWorkRanges() {
@@ -247,6 +370,11 @@ async function saveKey(key, value) {
  * work inside a sandboxed in-chat preview.
  */
 const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com"; // <- replace after deploying, see Drive sync panel
+// Bumped by hand on every meaningful code change, and shown in the Drive
+// sync panel — a quick way to confirm a device is actually running the
+// latest deployed build rather than something stale a service worker or
+// browser cache is still hanging onto.
+const BUILD_TAG = "2026.08.18-13";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -323,6 +451,41 @@ function timeAgo(iso) {
   return `${Math.round(h / 24)}d ago`;
 }
 
+// Remembers the live Drive connection (access token + which file, with the
+// token's own expiry) in sessionStorage, so refreshing the page resumes the
+// same session instead of forcing a full reconnect + reconciliation every
+// time. Cleared automatically once the token's actual expiry passes, and
+// whenever you close the tab (sessionStorage's normal behavior) or disconnect.
+const DRIVE_SESSION_KEY = "slate:driveSession";
+function saveDriveSession(token, expiresAt, fileId) {
+  try { window.sessionStorage.setItem(DRIVE_SESSION_KEY, JSON.stringify({ token, expiresAt, fileId })); } catch (e) { /* ignore */ }
+}
+function loadDriveSession() {
+  try {
+    const raw = window.sessionStorage.getItem(DRIVE_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed.token || !parsed.fileId || !parsed.expiresAt || Date.now() >= parsed.expiresAt - 30000) return null;
+    return parsed;
+  } catch (e) { return null; }
+}
+function clearDriveSession() {
+  try { window.sessionStorage.removeItem(DRIVE_SESSION_KEY); } catch (e) { /* ignore */ }
+}
+
+/* which occurrence of a repeating task "today" (or this week/month) counts
+   as, for the sidebar's simple checkbox — reuses periodsFor's own logic (with
+   horizonDays=1, which is enough to always yield exactly the current period)
+   so this always lines up with whatever computeSchedule considers period 0,
+   whether the task is flexible or pinned to a specific due weekday/day. */
+function currentPeriodKeyFor(task, refDate) {
+  if (!task.repeat || task.repeat === "none") return null;
+  const today = startOfDay(refDate);
+  const periods = periodsFor(task.repeat, today, 1, task.repeatDueRule);
+  if (!periods.length) return null;
+  return `${task.id}::${periods[0].key}`;
+}
+
 /* =================================== app =================================== */
 
 export default function App() {
@@ -333,6 +496,7 @@ export default function App() {
   const [workRanges, setWorkRanges] = useState({});
   const [privateRanges, setPrivateRanges] = useState({});
   const [completionLog, setCompletionLog] = useState([]); // history of completions, for the weekly review
+  const [completedOccurrences, setCompletedOccurrences] = useState([]); // which specific periods of repeating tasks are done, e.g. "taskId::d:2026-08-17"
 
   const [weekStartOffset, setWeekStartOffset] = useState(0); // in days
   const [taskModal, setTaskModal] = useState(null); // null | 'new' | task object
@@ -360,19 +524,35 @@ export default function App() {
   // Google Drive sync
   const [drive, setDrive] = useState({ status: "disconnected", fileId: null, lastSyncedAt: null, error: null });
   const [driveModalOpen, setDriveModalOpen] = useState(false);
+  const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
   const [driveConflict, setDriveConflict] = useState(null); // {fileId, driveData, localPayload, token}
   const driveTokenRef = useRef(null);
+  const driveTokenExpiryRef = useRef(null);
+  // the updatedAt string of the last version of the data we know Drive has —
+  // whether because we just wrote it, or just pulled it. Lets the polling
+  // check below tell "something changed elsewhere" apart from "I just wrote this myself"
+  const lastKnownDriveUpdatedAtRef = useRef(null);
+
+  // tracks whether THIS device has ever had real (non-default) data typed
+  // into it, and when it was actually last changed — used to tell a fresh
+  // device apart from one with real edits worth protecting during sync
+  const [hasLocalEdits, setHasLocalEdits] = useState(false);
+  const [localUpdatedAt, setLocalUpdatedAt] = useState(null);
+  const skipNextEditMarkRef = useRef(true);
 
   /* ---- load once ---- */
   useEffect(() => {
     (async () => {
-      const [t, be, lb, wr, pr, cl] = await Promise.all([
+      const [t, be, lb, wr, pr, cl, co, hle, lua] = await Promise.all([
         loadKey("tasks", null),
         loadKey("blockedEvents", null),
         loadKey("lockedBlocks", null),
         loadKey("workRanges", null),
         loadKey("privateRanges", null),
         loadKey("completionLog", null),
+        loadKey("completedOccurrences", null),
+        loadKey("hasLocalEdits", false),
+        loadKey("localUpdatedAt", null),
       ]);
       setTasks(t || seedTasks());
       setBlockedEvents(be || seedBlockedEvents());
@@ -380,6 +560,9 @@ export default function App() {
       setWorkRanges(wr || seedWorkRanges());
       setPrivateRanges(pr || seedPrivateRanges());
       setCompletionLog(cl || []);
+      setCompletedOccurrences(co || []);
+      setHasLocalEdits(hle);
+      setLocalUpdatedAt(lua);
       setReady(true);
     })();
   }, []);
@@ -391,6 +574,21 @@ export default function App() {
   useEffect(() => { if (ready) saveKey("workRanges", workRanges); }, [workRanges, ready]);
   useEffect(() => { if (ready) saveKey("privateRanges", privateRanges); }, [privateRanges, ready]);
   useEffect(() => { if (ready) saveKey("completionLog", completionLog); }, [completionLog, ready]);
+  useEffect(() => { if (ready) saveKey("completedOccurrences", completedOccurrences); }, [completedOccurrences, ready]);
+  useEffect(() => { if (ready) saveKey("hasLocalEdits", hasLocalEdits); }, [hasLocalEdits, ready]);
+  useEffect(() => { if (ready) saveKey("localUpdatedAt", localUpdatedAt); }, [localUpdatedAt, ready]);
+
+  // marks this device as having "real" data worth protecting during sync,
+  // and records exactly when it actually changed — but skips the very first
+  // run right after loading, so simply opening the app doesn't count as an edit
+  useEffect(() => {
+    if (!ready) return;
+    if (skipNextEditMarkRef.current) { skipNextEditMarkRef.current = false; console.log("[Slate/Drive] initial load — not marking as edited"); return; }
+    console.log("[Slate/Drive] marking this device as having real edits, task count =", tasks.length);
+    setHasLocalEdits(true);
+    setLocalUpdatedAt(new Date().toISOString());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, completedOccurrences, ready]);
 
   /* ---- undo keyboard shortcut (Ctrl/Cmd+Z) ---- */
   useEffect(() => {
@@ -414,15 +612,15 @@ export default function App() {
   /* ---- scheduling (recomputed whenever inputs change) ---- */
   const schedule = useMemo(() => {
     if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [] };
-    return computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, privateRanges });
-  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, ready]);
+    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges });
+  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, ready]);
 
   const tasksById = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
 
   const allBlocks = useMemo(() => {
     const locked = lockedBlocks.map(b => {
       const t = tasksById[b.taskId];
-      return { id: b.id, taskId: b.taskId, name: t ? t.name : "(deleted task)", category: t ? t.category : "work", start: new Date(b.start), end: new Date(b.end), locked: true, segIndex: 1, segTotal: 1 };
+      return { id: b.id, taskId: b.taskId, occurrenceKey: b.occurrenceKey || null, name: t ? t.name : "(deleted task)", category: t ? t.category : "work", start: new Date(b.start), end: new Date(b.end), locked: true, segIndex: 1, segTotal: 1 };
     });
     return [...locked, ...schedule.autoBlocks];
   }, [lockedBlocks, schedule.autoBlocks, tasksById]);
@@ -440,29 +638,36 @@ export default function App() {
     setLockedBlocks(prev => prev.filter(b => b.taskId !== id));
     showToast("Task deleted");
   }
-  function toggleComplete(task) {
+  function toggleComplete(task, occurrenceKey) {
+    if (task.repeat && task.repeat !== "none") {
+      const key = occurrenceKey || currentPeriodKeyFor(task, now);
+      if (completedOccurrences.includes(key)) {
+        setCompletedOccurrences(prev => prev.filter(k => k !== key));
+      } else {
+        setCompletingTask({ task, occurrenceKey: key });
+      }
+      return;
+    }
     if (!task.completed) {
       // completing now — ask how long it actually took before logging it
-      setCompletingTask(task);
+      setCompletingTask({ task, occurrenceKey: null });
     } else {
       // un-completing — just flip it back, no need to touch the log
       setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, completed: false } : t)));
     }
   }
 
-  function confirmComplete(task, actualDuration) {
-    setLockedBlocks(prev => prev.filter(b => b.taskId !== task.id)); // free up any locked slots for this occurrence
+  function confirmComplete(task, occurrenceKey, actualDuration) {
     setCompletionLog(prev => [...prev, {
       id: uid(), taskId: task.id, name: task.name, category: task.category, priority: task.priority,
       estimatedDuration: task.duration, actualDuration, completedAt: new Date().toISOString(),
     }]);
-    if (task.repeat !== "none") {
-      const nextDue = nextOccurrence(task.dueDate || new Date(), task.repeat);
-      setTasks(prev => prev.map(t => (t.id === task.id ? {
-        ...t, completed: false, lastCompletedAt: new Date().toISOString(), dueDate: nextDue.toISOString(),
-      } : t)));
-      showToast(`Nice work! Next "${task.name}" queued for ${monthDayLabel(nextDue)}`);
+    if (task.repeat && task.repeat !== "none") {
+      setLockedBlocks(prev => prev.filter(b => b.occurrenceKey !== occurrenceKey)); // free up any locked slot for just this occurrence
+      setCompletedOccurrences(prev => [...prev, occurrenceKey]);
+      showToast(`Nice work! "${task.name}" is done for this period — it'll come back next time around`);
     } else {
+      setLockedBlocks(prev => prev.filter(b => b.taskId !== task.id));
       setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, completed: true, lastCompletedAt: new Date().toISOString() } : t)));
       showToast(`Marked "${task.name}" complete — rescheduling the rest of your week`);
     }
@@ -500,7 +705,7 @@ export default function App() {
     const newEnd = addMinutes(newStart, durationMin);
     setLockedBlocks(prev => {
       const withoutThis = prev.filter(b => b.id !== block.id);
-      return [...withoutThis, { id: block.locked ? block.id : uid(), taskId: block.taskId, start: newStart.toISOString(), end: newEnd.toISOString() }];
+      return [...withoutThis, { id: block.locked ? block.id : uid(), taskId: block.taskId, occurrenceKey: block.occurrenceKey || null, start: newStart.toISOString(), end: newEnd.toISOString() }];
     });
     showToast("Block moved — everything else adjusted around it");
   }
@@ -512,7 +717,7 @@ export default function App() {
 
   /* ---- google drive sync ---- */
   function buildSyncPayload() {
-    return { tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, updatedAt: new Date().toISOString() };
+    return { tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, completedOccurrences, updatedAt: new Date().toISOString() };
   }
   function applyDriveData(data) {
     if (Array.isArray(data.tasks)) setTasks(data.tasks);
@@ -521,6 +726,7 @@ export default function App() {
     if (data.workRanges) setWorkRanges(data.workRanges);
     if (data.privateRanges) setPrivateRanges(data.privateRanges);
     if (Array.isArray(data.completionLog)) setCompletionLog(data.completionLog);
+    if (Array.isArray(data.completedOccurrences)) setCompletedOccurrences(data.completedOccurrences);
   }
 
   function connectDrive() {
@@ -540,6 +746,8 @@ export default function App() {
               return;
             }
             driveTokenRef.current = resp.access_token;
+            const expiresAt = Date.now() + (Number(resp.expires_in || 3600) * 1000);
+            driveTokenExpiryRef.current = expiresAt;
             await handleDriveConnected(resp.access_token);
           },
         });
@@ -552,42 +760,90 @@ export default function App() {
     try {
       let file = await driveFindFile(token);
       const localPayload = buildSyncPayload();
+      console.log("[Slate/Drive] connect: file found?", !!file, file);
+      console.log("[Slate/Drive] connect: hasLocalEdits =", hasLocalEdits, "local task count =", localPayload.tasks.length);
+
       if (!file) {
         file = await driveCreateFile(token, localPayload);
+        console.log("[Slate/Drive] branch: created new file (none existed)", file.id);
+        lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
         return;
       }
+
       const driveData = await driveReadFile(token, file.id);
-      const driveHasData = driveData && Array.isArray(driveData.tasks) && driveData.tasks.length > 0;
-      const driveTime = driveData?.updatedAt ? new Date(driveData.updatedAt).getTime() : 0;
-      const localTime = new Date(localPayload.updatedAt).getTime();
-      if (driveHasData && Math.abs(driveTime - localTime) > 60000) {
-        setDriveConflict({ fileId: file.id, driveData, localPayload, token });
-        setDrive(d => ({ ...d, status: "connecting" }));
-      } else if (driveHasData) {
-        applyDriveData(driveData);
-        setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
-        showToast("Loaded your schedule from Drive");
-      } else {
+      // "Has this file ever been really synced?" should be based on whether it
+      // was ever actually written by the app (it always carries an updatedAt
+      // stamp when it has), NOT on whether tasks happens to be non-empty right
+      // now — a legitimately-synced file can validly have zero tasks in it
+      // (e.g. everything got completed elsewhere), and treating that as "blank,
+      // nothing to lose" was exactly what caused silent overwrites.
+      const driveHasData = !!(driveData && typeof driveData === "object" && driveData.updatedAt);
+      console.log("[Slate/Drive] connect: driveData =", driveData, "driveHasData =", driveHasData);
+
+      if (!driveHasData) {
+        // Drive file exists but is empty/blank — nothing to lose, just push this device's data
+        console.log("[Slate/Drive] branch: drive file had no real data, pushing local");
         await driveWriteFile(token, file.id, localPayload);
+        lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
+        return;
       }
+
+      if (!hasLocalEdits) {
+        // this device has nothing of its own worth keeping yet (still just the
+        // starter tasks, or truly untouched) — adopt Drive's real schedule, no prompt needed
+        console.log("[Slate/Drive] branch: no local edits, pulling from Drive");
+        applyDriveData(driveData);
+        lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
+        setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
+        showToast("Loaded your schedule from Drive");
+        return;
+      }
+
+      const sameContent =
+        JSON.stringify(driveData.tasks) === JSON.stringify(localPayload.tasks) &&
+        JSON.stringify(driveData.blockedEvents) === JSON.stringify(localPayload.blockedEvents) &&
+        JSON.stringify(driveData.completionLog) === JSON.stringify(localPayload.completionLog) &&
+        JSON.stringify(driveData.completedOccurrences) === JSON.stringify(localPayload.completedOccurrences);
+      console.log("[Slate/Drive] connect: sameContent =", sameContent);
+
+      if (sameContent) {
+        lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
+        setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
+        showToast("Already in sync with Drive");
+        return;
+      }
+
+      // both sides have real, different data — let the person choose, rather than guessing
+      console.log("[Slate/Drive] branch: showing conflict dialog");
+      setDriveConflict({ fileId: file.id, driveData, localPayload, token });
+      setDrive(d => ({ ...d, status: "connecting" }));
     } catch (e) {
+      console.log("[Slate/Drive] connect: threw an error", e);
       setDrive(d => ({ ...d, status: "error", error: e.message }));
     }
   }
 
   function resolveDriveConflict(choice) {
     const { fileId, driveData, localPayload, token } = driveConflict;
-    if (choice === "drive") {
+    if (choice === "cancel") {
+      setDrive({ status: "disconnected", fileId: null, lastSyncedAt: null, error: null });
+      showToast("Connection cancelled — nothing was changed");
+    } else if (choice === "drive") {
       applyDriveData(driveData);
+      lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
       setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null });
       showToast("Loaded the version from Drive");
     } else {
       driveWriteFile(token, fileId, localPayload)
-        .then(() => { setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null }); showToast("Pushed this device's schedule to Drive"); })
+        .then(() => {
+          lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
+          setDrive({ status: "connected", fileId, lastSyncedAt: new Date().toISOString(), error: null });
+          showToast("Pushed this device's schedule to Drive");
+        })
         .catch(e => setDrive(d => ({ ...d, status: "error", error: e.message })));
     }
     setDriveConflict(null);
@@ -595,28 +851,85 @@ export default function App() {
 
   function disconnectDrive() {
     driveTokenRef.current = null;
+    driveTokenExpiryRef.current = null;
+    clearDriveSession();
     setDrive({ status: "disconnected", fileId: null, lastSyncedAt: null, error: null });
     showToast("Disconnected — your data stays on this device only");
   }
 
   function manualSyncDrive() {
     if (drive.status !== "connected" || !driveTokenRef.current || !drive.fileId) return;
-    driveWriteFile(driveTokenRef.current, drive.fileId, buildSyncPayload())
-      .then(() => { setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); showToast("Synced to Drive"); })
-      .catch(e => setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })));
+    const payload = buildSyncPayload();
+    driveWriteFile(driveTokenRef.current, drive.fileId, payload)
+      .then(() => { lastKnownDriveUpdatedAtRef.current = payload.updatedAt; setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); showToast("Synced to Drive"); })
+      .catch(() => { setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })); showToast("Drive sync failed — reconnect to keep going"); });
   }
 
   // auto-push to Drive a couple seconds after any change, once connected
   useEffect(() => {
     if (drive.status !== "connected" || !driveTokenRef.current || !drive.fileId) return;
     const t = setTimeout(() => {
-      driveWriteFile(driveTokenRef.current, drive.fileId, buildSyncPayload())
-        .then(() => setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })))
-        .catch(() => setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })));
+      const payload = buildSyncPayload();
+      driveWriteFile(driveTokenRef.current, drive.fileId, payload)
+        .then(() => { lastKnownDriveUpdatedAtRef.current = payload.updatedAt; setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() })); })
+        .catch(() => { setDrive(d => ({ ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." })); showToast("Drive sync paused — reconnect to keep going"); });
     }, 2000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, drive.status, drive.fileId]);
+  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, completedOccurrences, drive.status, drive.fileId]);
+
+  // remember this connection across a page refresh, so reloading resumes
+  // instead of forcing a full reconnect
+  useEffect(() => {
+    if (drive.status === "connected" && drive.fileId && driveTokenRef.current && driveTokenExpiryRef.current) {
+      saveDriveSession(driveTokenRef.current, driveTokenExpiryRef.current, drive.fileId);
+    }
+  }, [drive.status, drive.fileId]);
+
+  // on first load, silently resume a still-valid session from before a
+  // refresh — no reconnect click, no reconciliation, just pick up where
+  // things left off (the immediate poll right below catches up on anything
+  // that changed elsewhere during the reload gap)
+  useEffect(() => {
+    if (!ready) return;
+    const session = loadDriveSession();
+    if (session) {
+      driveTokenRef.current = session.token;
+      driveTokenExpiryRef.current = session.expiresAt;
+      lastKnownDriveUpdatedAtRef.current = null; // force the next poll to reconcile, rather than assume it's already in sync
+      setDrive({ status: "connected", fileId: session.fileId, lastSyncedAt: null, error: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  // poll Drive every 15s for changes made from another device, so two open
+  // devices actually catch up to each other without needing a manual
+  // disconnect/reconnect. Skips applying anything that turns out to just be
+  // an echo of this device's own last push. Also runs once immediately when
+  // a connection starts/resumes, so you're not waiting up to 15s to catch up.
+  useEffect(() => {
+    if (drive.status !== "connected" || !drive.fileId) return;
+    let cancelled = false;
+    const poll = async (isInitial) => {
+      if (!driveTokenRef.current) return;
+      try {
+        const data = await driveReadFile(driveTokenRef.current, drive.fileId);
+        if (cancelled) return;
+        if (data && data.updatedAt && data.updatedAt !== lastKnownDriveUpdatedAtRef.current) {
+          applyDriveData(data);
+          lastKnownDriveUpdatedAtRef.current = data.updatedAt;
+          setDrive(d => ({ ...d, lastSyncedAt: new Date().toISOString() }));
+          if (!isInitial) showToast("Updated from another device");
+        }
+      } catch (e) {
+        if (!cancelled) setDrive(d => (d.status === "connected" ? { ...d, status: "expired", error: "Drive session expired — reconnect to keep syncing." } : d));
+      }
+    };
+    poll(true);
+    const id = setInterval(() => poll(false), 15000);
+    return () => { cancelled = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drive.status, drive.fileId]);
 
   const weekStart = addDays(startOfDay(now), weekStartOffset);
   const weekDays = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
@@ -652,26 +965,44 @@ export default function App() {
     return <div className="loading-screen">Loading your week…</div>;
   }
 
+  const sidebarProps = {
+    tasks: filteredTasks,
+    overdueIds: schedule.overdue,
+    unscheduledIds: schedule.unscheduled,
+    categoryFilter, setCategoryFilter,
+    search, setSearch,
+    showCompleted, setShowCompleted,
+    onAddTask: () => { setTaskModal("new"); setMobileTasksOpen(false); },
+    onEditTask: (t) => { setTaskModal(t); setMobileTasksOpen(false); },
+    onDeleteTask: deleteTask,
+    onToggleComplete: toggleComplete,
+    completedOccurrences,
+    now,
+    blockedEvents,
+    onAddBlocked: () => { setBlockedModal("new"); setMobileTasksOpen(false); },
+    onEditBlocked: (e) => { setBlockedModal(e); setMobileTasksOpen(false); },
+    onDeleteBlocked: deleteBlockedEvent,
+  };
+
   return (
     <div className="app">
       <style>{CSS}</style>
 
       <Sidebar
-        tasks={filteredTasks}
-        overdueIds={schedule.overdue}
-        unscheduledIds={schedule.unscheduled}
-        categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter}
-        search={search} setSearch={setSearch}
-        showCompleted={showCompleted} setShowCompleted={setShowCompleted}
-        onAddTask={() => setTaskModal("new")}
-        onEditTask={(t) => setTaskModal(t)}
-        onDeleteTask={deleteTask}
-        onToggleComplete={toggleComplete}
-        blockedEvents={blockedEvents}
-        onAddBlocked={() => setBlockedModal("new")}
-        onEditBlocked={(e) => setBlockedModal(e)}
-        onDeleteBlocked={deleteBlockedEvent}
+        {...sidebarProps}
       />
+
+      {mobileTasksOpen && (
+        <div className="mobile-drawer-backdrop" onClick={(e) => { if (e.target === e.currentTarget) setMobileTasksOpen(false); }}>
+          <div className="mobile-drawer">
+            <div className="mobile-drawer-head">
+              <span>Tasks & blocked time</span>
+              <button className="icon-btn small" onClick={() => setMobileTasksOpen(false)}><X size={16} /></button>
+            </div>
+            <Sidebar {...sidebarProps} />
+          </div>
+        </div>
+      )}
 
       <div className="main">
         <Header
@@ -687,6 +1018,7 @@ export default function App() {
           onOpenReview={() => setReviewOpen(true)}
           driveStatus={drive.status}
           onOpenDrive={() => setDriveModalOpen(true)}
+          onOpenMobileTasks={() => setMobileTasksOpen(true)}
         />
         <CalendarGrid
           weekDays={weekDays}
@@ -695,7 +1027,7 @@ export default function App() {
           overdueIds={schedule.overdue}
           onDropBlock={lockBlockAt}
           onUnlockBlock={unlockBlock}
-          onToggleComplete={(taskId) => { const t = tasksById[taskId]; if (t) toggleComplete(t); }}
+          onToggleComplete={(taskId, occurrenceKey) => { const t = tasksById[taskId]; if (t) toggleComplete(t, occurrenceKey); }}
           onEditTask={(taskId) => { const t = tasksById[taskId]; if (t) setTaskModal(t); }}
           now={now}
         />
@@ -731,9 +1063,9 @@ export default function App() {
 
       {completingTask && (
         <CompleteModal
-          task={completingTask}
+          task={completingTask.task}
           onClose={() => setCompletingTask(null)}
-          onConfirm={(actualDuration) => confirmComplete(completingTask, actualDuration)}
+          onConfirm={(actualDuration) => confirmComplete(completingTask.task, completingTask.occurrenceKey, actualDuration)}
         />
       )}
 
@@ -761,7 +1093,7 @@ export default function App() {
       )}
 
       {driveConflict && (
-        <DriveConflictModal onResolve={resolveDriveConflict} />
+        <DriveConflictModal conflict={driveConflict} localUpdatedAt={localUpdatedAt} onResolve={resolveDriveConflict} />
       )}
 
       {toast && <div className="toast">{toast}</div>}
@@ -771,7 +1103,7 @@ export default function App() {
 
 /* ================================ header =================================== */
 
-function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTask, onUndo, canUndo, onOpenReview, driveStatus, onOpenDrive }) {
+function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTask, onUndo, canUndo, onOpenReview, driveStatus, onOpenDrive, onOpenMobileTasks }) {
   const first = weekDays[0], last = weekDays[6];
   const label = first.getMonth() === last.getMonth()
     ? `${MONTH_LABELS[first.getMonth()]} ${first.getDate()}–${last.getDate()}`
@@ -779,6 +1111,9 @@ function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTa
   return (
     <div className="header">
       <div className="header-left">
+        <button className="mobile-tasks-btn" onClick={onOpenMobileTasks} title="Tasks & blocked time">
+          <CalendarDays size={16} />
+        </button>
         <div className="brand"><span className="brand-dot" />Slate</div>
         <div className="week-nav">
           <button className="icon-btn" onClick={onPrev}><ChevronLeft size={16} /></button>
@@ -813,7 +1148,7 @@ function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTa
 function Sidebar({
   tasks, overdueIds, unscheduledIds, categoryFilter, setCategoryFilter, search, setSearch,
   showCompleted, setShowCompleted, onAddTask, onEditTask, onDeleteTask, onToggleComplete,
-  blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked,
+  blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked, completedOccurrences, now,
 }) {
   return (
     <div className="sidebar">
@@ -846,9 +1181,11 @@ function Sidebar({
             key={t.id} task={t}
             isOverdue={overdueIds.includes(t.id)}
             isUnscheduled={unscheduledIds.includes(t.id)}
+            completedOccurrences={completedOccurrences}
+            now={now}
             onEdit={() => onEditTask(t)}
             onDelete={() => onDeleteTask(t.id)}
-            onToggle={() => onToggleComplete(t)}
+            onToggle={() => onToggleComplete(t, currentPeriodKeyFor(t, now))}
           />
         ))}
 
@@ -874,22 +1211,27 @@ function Sidebar({
   );
 }
 
-function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle }) {
+function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, completedOccurrences, now }) {
   const cat = CATEGORY_META[task.category];
   const pri = PRIORITY_META[task.priority];
   const Icon = cat.icon;
+  const isRepeating = task.repeat && task.repeat !== "none";
+  const currentKey = isRepeating ? currentPeriodKeyFor(task, now) : null;
+  const isDone = isRepeating ? (completedOccurrences || []).includes(currentKey) : task.completed;
   return (
-    <div className={`task-row ${task.completed ? "task-row-done" : ""}`}>
+    <div className={`task-row ${isDone ? "task-row-done" : ""}`}>
       <button className="check-btn" onClick={onToggle} style={{ "--pc": pri.color }}>
-        {task.completed && <Check size={12} />}
+        {isDone && <Check size={12} />}
       </button>
       <div className="task-info" onClick={onEdit}>
         <div className="task-name">{task.name}</div>
         <div className="task-meta">
           <span className="meta-chip" style={{ color: cat.accent }}><Icon size={11} /> {cat.label}</span>
           <span className="meta-chip"><Clock size={11} /> {formatDuration(task.duration)}</span>
-          {task.repeat !== "none" && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
-          {task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
+          {isRepeating && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
+          {isRepeating && repeatDueLabel(task) && <span className="meta-chip">{repeatDueLabel(task)}</span>}
+          {isRepeating && isDone && <span className="meta-chip">Done for now{task.repeat === "daily" ? " — back tomorrow" : task.repeat === "weekly" ? " — back next week" : " — back next month"}</span>}
+          {!isRepeating && task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
           {isOverdue && <span className="meta-chip meta-warn"><AlertTriangle size={11} /> At risk</span>}
           {isUnscheduled && <span className="meta-chip meta-danger"><AlertTriangle size={11} /> Won't fit</span>}
         </div>
@@ -1027,7 +1369,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
                         {risky && <AlertTriangle size={11} className="risk-flag" />}
                       </div>
                       <div className="task-block-actions">
-                        <button onClick={(e) => { e.stopPropagation(); onToggleComplete(b.taskId); }} title="Mark complete"><Check size={11} /></button>
+                        <button onClick={(e) => { e.stopPropagation(); onToggleComplete(b.taskId, b.occurrenceKey); }} title="Mark complete"><Check size={11} /></button>
                         {b.locked && <button onClick={(e) => { e.stopPropagation(); onUnlockBlock(b); }} title="Reset to auto-schedule"><RotateCcw size={11} /></button>}
                       </div>
                     </div>
@@ -1049,6 +1391,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
 /* =============================== task modal ================================= */
 
 function TaskModal({ initial, onClose, onSave }) {
+  const today = new Date();
   const [name, setName] = useState(initial?.name || "");
   const [category, setCategory] = useState(initial?.category || "work");
   const [priority, setPriority] = useState(initial?.priority || "medium");
@@ -1057,12 +1400,27 @@ function TaskModal({ initial, onClose, onSave }) {
   const [dueDate, setDueDate] = useState(initial?.dueDate ? new Date(initial.dueDate).toISOString().slice(0, 10) : "");
   const [repeat, setRepeat] = useState(initial?.repeat || "none");
 
+  // repeat-segment due day — only meaningful for weekly/monthly repeats.
+  const [hasRepeatDue, setHasRepeatDue] = useState(initial?.repeatDueRule != null);
+  const [repeatDueWeekday, setRepeatDueWeekday] = useState(
+    initial?.repeat === "weekly" && initial?.repeatDueRule != null ? initial.repeatDueRule : today.getDay()
+  );
+  const [repeatDueLastDay, setRepeatDueLastDay] = useState(initial?.repeat === "monthly" && initial?.repeatDueRule === -1);
+  const [repeatDueDay, setRepeatDueDay] = useState(
+    initial?.repeat === "monthly" && initial?.repeatDueRule != null && initial.repeatDueRule !== -1
+      ? initial.repeatDueRule
+      : today.getDate()
+  );
+
   function submit() {
     if (!name.trim()) return;
+    let repeatDueRule = null;
+    if (repeat === "weekly" && hasRepeatDue) repeatDueRule = repeatDueWeekday;
+    if (repeat === "monthly" && hasRepeatDue) repeatDueRule = repeatDueLastDay ? -1 : (Number(repeatDueDay) || 1);
     onSave({
       name: name.trim(), category, priority, duration: Number(duration) || 15,
       dueDate: hasDue && dueDate ? new Date(dueDate + "T23:59:00").toISOString() : null,
-      repeat,
+      repeat, repeatDueRule,
     });
   }
 
@@ -1099,13 +1457,50 @@ function TaskModal({ initial, onClose, onSave }) {
       <select className="text-input" value={repeat} onChange={e => setRepeat(e.target.value)}>
         {Object.entries(REPEAT_META).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
       </select>
-      {repeat !== "none" && <div className="hint-text">Flexible — Slate fits it in anywhere in the {repeat === "daily" ? "day" : repeat === "weekly" ? "week" : "month"}, wherever there's room.</div>}
 
-      <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
-        <span>Due date</span>
-        <input type="checkbox" checked={hasDue} onChange={e => setHasDue(e.target.checked)} />
-      </label>
-      {hasDue && <input className="text-input" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />}
+      {(repeat === "weekly" || repeat === "monthly") && (
+        <>
+          <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
+            <span>Due on a specific {repeat === "weekly" ? "day of the week" : "day of the month"}</span>
+            <input type="checkbox" checked={hasRepeatDue} onChange={e => setHasRepeatDue(e.target.checked)} />
+          </label>
+          {hasRepeatDue && repeat === "weekly" && (
+            <select className="text-input" value={repeatDueWeekday} onChange={e => setRepeatDueWeekday(Number(e.target.value))}>
+              {DAY_LABELS.map((d, i) => <option key={i} value={i}>{d}</option>)}
+            </select>
+          )}
+          {hasRepeatDue && repeat === "monthly" && (
+            <div className="row-inline">
+              <input
+                className="text-input small" type="number" min={1} max={31}
+                disabled={repeatDueLastDay} value={repeatDueDay}
+                onChange={e => setRepeatDueDay(e.target.value)}
+              />
+              <label className="row-inline" style={{ gap: 6 }}>
+                <input type="checkbox" checked={repeatDueLastDay} onChange={e => setRepeatDueLastDay(e.target.checked)} />
+                <span className="unit-label">Last day of month</span>
+              </label>
+            </div>
+          )}
+        </>
+      )}
+      {repeat !== "none" && (
+        <div className="hint-text">
+          {!hasRepeatDue && `Flexible — Slate fits it in anywhere in the ${repeat === "daily" ? "day" : repeat === "weekly" ? "week" : "month"}, wherever there's room.`}
+          {hasRepeatDue && repeat === "weekly" && `Slate fits it in sometime that week, but flags it if it slips past ${DAY_LABELS[repeatDueWeekday]}.`}
+          {hasRepeatDue && repeat === "monthly" && `Slate fits it in sometime that month, but flags it if it slips past the ${repeatDueLastDay ? "last day" : ordinal(Number(repeatDueDay) || 1)}.`}
+        </div>
+      )}
+
+      {repeat === "none" && (
+        <>
+          <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
+            <span>Due date</span>
+            <input type="checkbox" checked={hasDue} onChange={e => setHasDue(e.target.checked)} />
+          </label>
+          {hasDue && <input className="text-input" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />}
+        </>
+      )}
 
       <div className="modal-actions">
         <button className="secondary-btn" onClick={onClose}>Cancel</button>
@@ -1401,7 +1796,7 @@ function DriveSyncModal({ drive, onConnect, onDisconnect, onManualSync, onClose 
   return (
     <ModalShell title="Google Drive sync" onClose={onClose}>
       <div className="hint-text" style={{ marginBottom: 14 }}>
-        Keeps one JSON file, created by this app in your own Drive, in sync with your tasks, blocks, and hours. Connect the same account on another device to share the same schedule there — nothing else in your Drive is touched.
+        Keeps one JSON file, created by this app in your own Drive, in sync with your tasks, blocks, and hours. Connect the same account on another device to share the same schedule there — nothing else in your Drive is touched. Once connected, changes made on either device show up on the other within about 15 seconds, no need to reload — and refreshing the page won't disconnect you either, it'll just pick back up.
       </div>
 
       {drive.status === "connected" && (
@@ -1446,19 +1841,34 @@ function DriveSyncModal({ drive, onConnect, onDisconnect, onManualSync, onClose 
         <li>Paste that Client ID into <code>GOOGLE_CLIENT_ID</code> in the code and redeploy.</li>
       </ol>
       <div className="hint-text">This only works once the app is running at a real, fixed URL — Google won't grant access to a sandboxed preview link.</div>
+      <div className="build-tag">Build {BUILD_TAG}</div>
     </ModalShell>
   );
 }
 
-function DriveConflictModal({ onResolve }) {
+function DriveConflictModal({ conflict, localUpdatedAt, onResolve }) {
+  const driveCount = conflict.driveData?.tasks?.length ?? 0;
+  const localCount = conflict.localPayload?.tasks?.length ?? 0;
+  const driveWhen = conflict.driveData?.updatedAt ? timeAgo(conflict.driveData.updatedAt) : "unknown";
+  const localWhen = localUpdatedAt ? timeAgo(localUpdatedAt) : "just now";
   return (
-    <ModalShell title="Two schedules found" onClose={() => onResolve("local")}>
+    <ModalShell title="Two schedules found" onClose={() => onResolve("cancel")}>
       <div className="hint-text" style={{ marginBottom: 16 }}>
-        Drive already has a saved schedule that's different from what's on this device. Which one should win? The other will be overwritten.
+        Drive already has a saved schedule that's different from what's on this device. Nothing changes until you pick one — closing this without choosing just cancels the connection, nothing is touched.
+      </div>
+      <div className="conflict-compare">
+        <div className="conflict-side">
+          <div className="conflict-side-title">This device</div>
+          <div className="conflict-side-meta">{localCount} tasks · edited {localWhen}</div>
+        </div>
+        <div className="conflict-side">
+          <div className="conflict-side-title">Google Drive</div>
+          <div className="conflict-side-meta">{driveCount} tasks · edited {driveWhen}</div>
+        </div>
       </div>
       <div className="modal-actions" style={{ justifyContent: "space-between" }}>
-        <button className="secondary-btn" onClick={() => onResolve("local")}>Keep this device's data</button>
-        <button className="primary-btn" onClick={() => onResolve("drive")}>Load from Drive</button>
+        <button className="secondary-btn" onClick={() => onResolve("local")}>Erase Drive, use this device</button>
+        <button className="primary-btn" onClick={() => onResolve("drive")}>Erase this device, use Drive</button>
       </div>
     </ModalShell>
   );
@@ -1487,18 +1897,20 @@ const CSS = `
 
 :root{
   --bg:#0A0C11; --bg-elevated:#10131A; --surface:#161A23; --surface-hover:#1D222D;
-  --border:#242A36; --text:#E8EAEF; --text-dim:#8A90A0; --text-faint:#565C6B;
+  --border:#242A36; --border-soft:rgba(255,255,255,0.05); --text:#E8EAEF; --text-dim:#8A90A0; --text-faint:#565C6B;
   --danger:#FF5C6C; --success:#4ADE80;
   --radius:12px;
 }
 *{box-sizing:border-box;}
+html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavior:none; background:#0A0C11;}
+#root{height:100%;}
 .app, .app *{font-family:'Inter',system-ui,sans-serif;}
 .app{
-  display:flex; width:100%; height:100vh; background:var(--bg); color:var(--text);
+  display:flex; width:100%; height:100vh; height:100dvh; background:var(--bg); color:var(--text);
   overflow:hidden;
 }
 .loading-screen{
-  width:100%; height:100vh; display:flex; align-items:center; justify-content:center;
+  width:100%; height:100vh; height:100dvh; display:flex; align-items:center; justify-content:center;
   background:var(--bg); color:var(--text-dim); font-family:'Inter',sans-serif; font-size:14px;
 }
 
@@ -1559,6 +1971,11 @@ const CSS = `
 .icon-btn.small{padding:4px;}
 .icon-btn.ghost{opacity:0; }
 .task-row:hover .icon-btn.ghost{opacity:1;}
+.mobile-tasks-btn{
+  background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer;
+  padding:7px; border-radius:9px; align-items:center; justify-content:center; flex-shrink:0;
+}
+.mobile-tasks-btn:active{background:var(--surface-hover);}
 
 .blocked-row{
   display:flex; align-items:center; gap:8px; padding:8px 6px; border-radius:10px; cursor:pointer; transition:background .15s;
@@ -1570,7 +1987,7 @@ const CSS = `
 .blocked-sub{font-size:11px; color:var(--text-faint); margin-top:2px;}
 
 /* ---------- main / header ---------- */
-.main{flex:1; display:flex; flex-direction:column; min-width:0;}
+.main{flex:1; display:flex; flex-direction:column; min-width:0; min-height:0;}
 .header{
   display:flex; align-items:center; justify-content:space-between; padding:14px 20px;
   border-bottom:1px solid var(--border); background:var(--bg-elevated);
@@ -1602,13 +2019,13 @@ const CSS = `
 .secondary-btn:hover{background:var(--surface-hover);}
 
 /* ---------- calendar ---------- */
-.calendar-wrap{flex:1; overflow:hidden; background:var(--bg);}
-.calendar-scroll{height:100%; overflow-y:auto; overflow-x:auto;}
+.calendar-wrap{flex:1; overflow:hidden; background:var(--bg); min-height:0;}
+.calendar-scroll{height:100%; overflow-y:auto; overflow-x:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;}
 .calendar-grid{display:grid; min-width:820px;}
 .gutter-header{position:sticky; top:0; z-index:5; background:var(--bg);}
 .day-header{
   position:sticky; top:0; z-index:5; background:var(--bg); text-align:center; padding:10px 4px 12px;
-  border-bottom:1px solid var(--border); border-left:1px solid var(--border);
+  border-bottom:1px solid var(--border); border-left:1px solid var(--border-soft);
 }
 .day-header-today .day-header-num{
   background:linear-gradient(135deg,#5B8DEF,#7B6EF6); color:#fff; box-shadow:0 0 12px rgba(91,141,239,0.5);
@@ -1618,11 +2035,11 @@ const CSS = `
   font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:14px; width:26px; height:26px; border-radius:50%;
   display:flex; align-items:center; justify-content:center; margin:0 auto; color:var(--text);
 }
-.gutter{position:relative; border-right:1px solid var(--border);}
+.gutter{position:relative; border-right:1px solid var(--border-soft);}
 .hour-mark{position:absolute; right:8px; transform:translateY(-50%); font-size:10.5px; color:var(--text-faint); font-variant-numeric:tabular-nums;}
-.day-col{position:relative; border-left:1px solid var(--border);}
+.day-col{position:relative; border-left:1px solid var(--border-soft);}
 .day-col-today{background:rgba(91,141,239,0.035);}
-.hour-line{position:absolute; left:0; right:0; height:1px; background:var(--border);}
+.hour-line{position:absolute; left:0; right:0; height:1px; background:var(--border-soft);}
 .now-line{position:absolute; left:0; right:0; height:2px; background:var(--danger); z-index:3;}
 .now-dot{position:absolute; left:-4px; top:-3px; width:8px; height:8px; border-radius:50%; background:var(--danger); box-shadow:0 0 8px rgba(255,92,108,0.8);}
 
@@ -1745,8 +2162,13 @@ const CSS = `
 .drive-status{display:flex; align-items:center; gap:7px; font-size:12.5px; padding:9px 11px; border-radius:9px; background:var(--surface); border:1px solid var(--border);}
 .drive-status-ok{color:var(--success); border-color:#1f4a34;}
 .drive-status-warn{color:#FFB86B; border-color:#4a3a20;}
+.conflict-compare{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:16px;}
+.conflict-side{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:10px 12px;}
+.conflict-side-title{font-size:11.5px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.03em; margin-bottom:4px;}
+.conflict-side-meta{font-size:12.5px; color:var(--text);}
 .setup-steps{margin:8px 0 0; padding-left:18px; font-size:11.5px; color:var(--text-faint); line-height:1.7;}
 .setup-steps code{background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--text-dim); font-size:11px;}
+.build-tag{margin-top:14px; font-size:10.5px; color:var(--text-faint); text-align:center; font-variant-numeric:tabular-nums;}
 @media (max-width: 820px){
   .review-stats-row{grid-template-columns:repeat(2,1fr);}
   .review-two-col{grid-template-columns:1fr;}
@@ -1756,11 +2178,37 @@ const CSS = `
 .sidebar-scroll::-webkit-scrollbar, .calendar-scroll::-webkit-scrollbar, .modal::-webkit-scrollbar{width:8px; height:8px;}
 .sidebar-scroll::-webkit-scrollbar-thumb, .calendar-scroll::-webkit-scrollbar-thumb, .modal::-webkit-scrollbar-thumb{background:#2a2f3b; border-radius:8px;}
 
+.mobile-tasks-btn{display:none;}
+
 @media (max-width: 820px){
   .app{flex-direction:column;}
-  .sidebar{width:100%; min-width:0; max-height:38vh; border-right:none; border-bottom:1px solid var(--border);}
+  .sidebar{display:none;} /* on mobile the sidebar only appears inside the drawer below */
   .header{padding:10px 12px;}
-  .header-left{gap:12px;}
+  .header-left{gap:10px;}
   .stat-pill{display:none;}
+  .mobile-tasks-btn{display:flex;}
+}
+
+/* ---------- mobile tasks drawer ---------- */
+.mobile-drawer-backdrop{
+  position:fixed; inset:0; background:rgba(5,6,9,0.55); z-index:60;
+  display:flex; flex-direction:column; align-items:stretch;
+  animation:drawer-fade-in .15s ease-out;
+}
+@keyframes drawer-fade-in{from{opacity:0;} to{opacity:1;}}
+.mobile-drawer{
+  background:var(--bg-elevated); border-bottom:1px solid var(--border);
+  border-radius:0 0 18px 18px; box-shadow:0 20px 50px rgba(0,0,0,0.55);
+  max-height:82vh; display:flex; flex-direction:column; overflow:hidden;
+  animation:drawer-slide-down .2s ease-out;
+}
+@keyframes drawer-slide-down{from{transform:translateY(-12px); opacity:0;} to{transform:translateY(0); opacity:1;}}
+.mobile-drawer-head{
+  display:flex; align-items:center; justify-content:space-between; padding:14px 16px;
+  border-bottom:1px solid var(--border); font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:14.5px;
+  flex-shrink:0;
+}
+.mobile-drawer .sidebar{
+  display:flex; width:100%; min-width:0; min-height:0; max-height:none; border-right:none; padding:12px 14px 20px; flex:1; overflow-y:auto;
 }
 `;
