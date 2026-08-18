@@ -377,7 +377,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-13";
+const BUILD_TAG = "2026.08.18-14";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -1339,7 +1339,10 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
 
                 {dayBusy.map((b, i) => {
                   const top = minutesFromGridTop(b.start) * PX_PER_MIN;
-                  const height = Math.max(18, ((b.end - b.start) / MIN_MS) * PX_PER_MIN);
+                  // never inflate past the real duration — a min-height here would
+                  // make short blocks visually bleed into whatever comes right after
+                  // them, since top is based on real (uninflated) start time.
+                  const height = Math.max(4, ((b.end - b.start) / MIN_MS) * PX_PER_MIN - 2);
                   return (
                     <div key={i} className="busy-block" style={{ top, height }}>
                       <Ban size={11} /> {b.title || "Blocked"}
@@ -1349,14 +1352,25 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
 
                 {dayBlocks.map(b => {
                   const top = minutesFromGridTop(b.start) * PX_PER_MIN;
-                  const height = Math.max(20, ((b.end - b.start) / MIN_MS) * PX_PER_MIN);
+                  const rawHeight = ((b.end - b.start) / MIN_MS) * PX_PER_MIN;
+                  // -2px leaves a small visual gap between back-to-back blocks
+                  // instead of them touching edge-to-edge; the floor is a tiny
+                  // sliver only, never large enough to overlap a neighbor.
+                  const height = Math.max(4, rawHeight - 2);
+                  // below this, there isn't room for two lines of text (title +
+                  // time range) — collapse to a single compact line instead of
+                  // clipping content or (worse) forcing the box taller than its
+                  // real time slot, which is what used to cause short back-to-back
+                  // tasks to visually overlap the next block.
+                  const compact = rawHeight < 34;
                   const cat = CATEGORY_META[b.category];
                   const risky = overdueIds.includes(b.taskId);
                   return (
                     <div
                       key={b.id}
-                      className={`task-block ${b.locked ? "task-block-locked" : ""}`}
+                      className={`task-block ${b.locked ? "task-block-locked" : ""} ${compact ? "task-block-compact" : ""}`}
                       draggable
+                      title={`${b.name} · ${fmt12(b.start)}–${fmt12(b.end)}`}
                       onDragStart={(e) => handleDragStart(e, b)}
                       onDragEnd={() => setDragGhost(null)}
                       style={{ top, height, "--accent": cat.accent, "--tint": cat.tint }}
@@ -1365,12 +1379,16 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
                       <div className="task-block-head">
                         <GripVertical size={11} className="grip" />
                         <span className="task-block-title">{b.name}</span>
+                        {compact && <span className="task-block-time-inline">{fmt12(b.start)}</span>}
+                        {compact && risky && <AlertTriangle size={11} className="risk-flag" />}
                       </div>
-                      <div className="task-block-sub">
-                        {fmt12(b.start)}–{fmt12(b.end)}
-                        {b.segTotal > 1 && <span className="seg-tag"> · {b.segIndex}/{b.segTotal}</span>}
-                        {risky && <AlertTriangle size={11} className="risk-flag" />}
-                      </div>
+                      {!compact && (
+                        <div className="task-block-sub">
+                          {fmt12(b.start)}–{fmt12(b.end)}
+                          {b.segTotal > 1 && <span className="seg-tag"> · {b.segIndex}/{b.segTotal}</span>}
+                          {risky && <AlertTriangle size={11} className="risk-flag" />}
+                        </div>
+                      )}
                       <div className="task-block-actions">
                         <button onClick={(e) => { e.stopPropagation(); onToggleComplete(b.taskId, b.occurrenceKey); }} title="Mark complete"><Check size={11} /></button>
                         {b.locked && <button onClick={(e) => { e.stopPropagation(); onUnlockBlock(b); }} title="Reset to auto-schedule"><RotateCcw size={11} /></button>}
@@ -2060,6 +2078,9 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 .task-block:hover{box-shadow:0 2px 10px rgba(0,0,0,0.45); z-index:4;}
 .task-block:active{cursor:grabbing;}
 .task-block-locked{border-style:solid; box-shadow:0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent);}
+.task-block-compact{padding:2px 6px; display:flex; align-items:center;}
+.task-block-compact .task-block-head{flex:1; min-width:0;}
+.task-block-time-inline{font-size:9.5px; color:var(--text-dim); flex-shrink:0; font-variant-numeric:tabular-nums; margin-left:auto; padding-left:4px;}
 .task-block-head{display:flex; align-items:center; gap:4px;}
 .grip{color:var(--text-faint); flex-shrink:0;}
 .task-block-title{font-size:11.5px; font-weight:600; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
