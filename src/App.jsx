@@ -59,6 +59,19 @@ function formatDuration(mins) {
   return `${h}h ${m}m`;
 }
 function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+/* short "Due Thu" / "Due 15th" / "Due last day" chip text for a repeating
+   task with a pinned repeatDueRule, or null if it's left flexible */
+function repeatDueLabel(task) {
+  if (task.repeat === "weekly" && task.repeatDueRule != null) return `Due ${DAY_LABELS[task.repeatDueRule]}`;
+  if (task.repeat === "monthly" && task.repeatDueRule != null) {
+    return task.repeatDueRule === -1 ? "Due last day" : `Due ${ordinal(task.repeatDueRule)}`;
+  }
+  return null;
+}
 
 /* helper: which weekday's ranges apply to a day, based on category hour settings */
 function rangesForDay(day, rangesByWeekday) {
@@ -83,32 +96,80 @@ function subtractBusy(freeRanges, busy) {
 
 function dayKey(d) { return startOfDay(d).toISOString().slice(0, 10); }
 
+/* number of days in a given month (month is 0-indexed, matches Date's getMonth()) */
+function daysInMonth(year, month) { return new Date(year, month + 1, 0).getDate(); }
+
 /**
  * The period windows a repeating task should get a fresh, independent
- * occurrence for for within [today, today+horizonDays) — one per day for
- * "daily", one per rolling 7-day chunk for "weekly", one per ~month for
- * "monthly". Each period gets its own occurrenceKey so it can be completed,
- * dragged, or left unscheduled independently of every other period.
+ * occurrence for within [today, today+horizonDays) — one per day for
+ * "daily", one per week for "weekly", one per month for "monthly". Each
+ * period gets its own occurrenceKey so it can be completed, dragged, or
+ * left unscheduled independently of every other period.
+ *
+ * `dueRule` optionally pins the period's deadline to a specific day instead
+ * of just "whenever the period happens to end":
+ *   - weekly:  dueRule is a weekday number, 0 (Sun) .. 6 (Sat)
+ *   - monthly: dueRule is a day-of-month, 1..31, or -1 for "last day of month"
+ * When dueRule is null/undefined the task is "flexible" and keeps the
+ * original rolling-window behavior (period end = the deadline, wherever
+ * that happens to fall relative to today).
  */
-function periodsFor(repeat, today, horizonDays) {
+function periodsFor(repeat, today, horizonDays, dueRule) {
   const periods = [];
+  const horizonEnd = addDays(today, horizonDays);
   if (repeat === "daily") {
     for (let i = 0; i < horizonDays; i++) {
       const start = addDays(today, i);
       periods.push({ start, end: addDays(start, 1), key: `d:${dayKey(start)}` });
     }
   } else if (repeat === "weekly") {
-    for (let i = 0; i < horizonDays; i += 7) {
-      const start = addDays(today, i);
-      periods.push({ start, end: addDays(start, 7), key: `w:${dayKey(start)}` });
+    if (dueRule == null) {
+      for (let i = 0; i < horizonDays; i += 7) {
+        const start = addDays(today, i);
+        periods.push({ start, end: addDays(start, 7), key: `w:${dayKey(start)}` });
+      }
+    } else {
+      // periods run from the day after one due-weekday to the next due-weekday
+      // (inclusive), so "due every Thursday" gives each week a real Thursday
+      // deadline instead of an arbitrary 7-day-from-today window.
+      let periodStart = today, guard = 0;
+      while (periodStart < horizonEnd && guard < 30) {
+        const diff = (dueRule - periodStart.getDay() + 7) % 7;
+        const due = addDays(periodStart, diff);
+        periods.push({ start: periodStart, end: addDays(due, 1), key: `w:${dayKey(due)}` });
+        periodStart = addDays(due, 1);
+        guard++;
+      }
     }
   } else if (repeat === "monthly") {
-    let start = today, guard = 0;
-    while (start < addDays(today, horizonDays) && guard < 12) {
-      const end = addMonthsSafe(start, 1);
-      periods.push({ start, end, key: `m:${dayKey(start)}` });
-      start = end;
-      guard++;
+    if (dueRule == null) {
+      let start = today, guard = 0;
+      while (start < horizonEnd && guard < 12) {
+        const end = addMonthsSafe(start, 1);
+        periods.push({ start, end, key: `m:${dayKey(start)}` });
+        start = end;
+        guard++;
+      }
+    } else {
+      // periods run from the day after one due-day-of-month to the next
+      // (inclusive), so "due the 15th" gives each month a real 15th deadline;
+      // short months clamp to their last day (or dueRule === -1 always means
+      // "the last day of the month", whatever that is).
+      let periodStart = today, guard = 0;
+      while (periodStart < horizonEnd && guard < 12) {
+        const y = periodStart.getFullYear(), m = periodStart.getMonth();
+        const dim = daysInMonth(y, m);
+        const targetDay = dueRule === -1 ? dim : Math.min(dueRule, dim);
+        let due = new Date(y, m, targetDay);
+        if (due < periodStart) {
+          const nm = m + 1, ny = y + Math.floor(nm / 12), nmi = ((nm % 12) + 12) % 12;
+          const dim2 = daysInMonth(ny, nmi);
+          due = new Date(ny, nmi, dueRule === -1 ? dim2 : Math.min(dueRule, dim2));
+        }
+        periods.push({ start: periodStart, end: addDays(due, 1), key: `m:${dayKey(due)}` });
+        periodStart = addDays(due, 1);
+        guard++;
+      }
     }
   }
   return periods;
@@ -175,7 +236,7 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
         due: t.dueDate ? new Date(t.dueDate) : null, remaining,
       });
     } else {
-      for (const p of periodsFor(t.repeat, today, horizonDays)) {
+      for (const p of periodsFor(t.repeat, today, horizonDays, t.repeatDueRule)) {
         const occurrenceKey = `${t.id}::${p.key}`;
         if (doneSet.has(occurrenceKey)) continue;
         const lockedForOcc = lockedBlocks.filter(b => b.occurrenceKey === occurrenceKey);
@@ -267,11 +328,11 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
 function seedTasks() {
   const today = startOfDay(new Date());
   return [
-    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", repeatDueRule: 4, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", repeatDueRule: null, completed: false, lastCompletedAt: null },
   ];
 }
 function seedWorkRanges() {
@@ -316,7 +377,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-12";
+const BUILD_TAG = "2026.08.18-13";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -416,15 +477,16 @@ function clearDriveSession() {
 }
 
 /* which occurrence of a repeating task "today" (or this week/month) counts
-   as, for the sidebar's simple checkbox — matches the i=0 period computeSchedule
-   generates, so ticking it here lines up with today's calendar block */
+   as, for the sidebar's simple checkbox — reuses periodsFor's own logic (with
+   horizonDays=1, which is enough to always yield exactly the current period)
+   so this always lines up with whatever computeSchedule considers period 0,
+   whether the task is flexible or pinned to a specific due weekday/day. */
 function currentPeriodKeyFor(task, refDate) {
   if (!task.repeat || task.repeat === "none") return null;
   const today = startOfDay(refDate);
-  if (task.repeat === "daily") return `${task.id}::d:${dayKey(today)}`;
-  if (task.repeat === "weekly") return `${task.id}::w:${dayKey(today)}`;
-  if (task.repeat === "monthly") return `${task.id}::m:${dayKey(today)}`;
-  return null;
+  const periods = periodsFor(task.repeat, today, 1, task.repeatDueRule);
+  if (!periods.length) return null;
+  return `${task.id}::${periods[0].key}`;
 }
 
 /* =================================== app =================================== */
@@ -1170,6 +1232,7 @@ function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, c
           <span className="meta-chip" style={{ color: cat.accent }}><Icon size={11} /> {cat.label}</span>
           <span className="meta-chip"><Clock size={11} /> {formatDuration(task.duration)}</span>
           {isRepeating && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
+          {isRepeating && repeatDueLabel(task) && <span className="meta-chip">{repeatDueLabel(task)}</span>}
           {isRepeating && isDone && <span className="meta-chip">Done for now{task.repeat === "daily" ? " — back tomorrow" : task.repeat === "weekly" ? " — back next week" : " — back next month"}</span>}
           {!isRepeating && task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
           {isOverdue && <span className="meta-chip meta-warn"><AlertTriangle size={11} /> At risk</span>}
@@ -1331,6 +1394,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
 /* =============================== task modal ================================= */
 
 function TaskModal({ initial, onClose, onSave }) {
+  const today = new Date();
   const [name, setName] = useState(initial?.name || "");
   const [category, setCategory] = useState(initial?.category || "work");
   const [priority, setPriority] = useState(initial?.priority || "medium");
@@ -1339,12 +1403,27 @@ function TaskModal({ initial, onClose, onSave }) {
   const [dueDate, setDueDate] = useState(initial?.dueDate ? new Date(initial.dueDate).toISOString().slice(0, 10) : "");
   const [repeat, setRepeat] = useState(initial?.repeat || "none");
 
+  // repeat-segment due day — only meaningful for weekly/monthly repeats.
+  const [hasRepeatDue, setHasRepeatDue] = useState(initial?.repeatDueRule != null);
+  const [repeatDueWeekday, setRepeatDueWeekday] = useState(
+    initial?.repeat === "weekly" && initial?.repeatDueRule != null ? initial.repeatDueRule : today.getDay()
+  );
+  const [repeatDueLastDay, setRepeatDueLastDay] = useState(initial?.repeat === "monthly" && initial?.repeatDueRule === -1);
+  const [repeatDueDay, setRepeatDueDay] = useState(
+    initial?.repeat === "monthly" && initial?.repeatDueRule != null && initial.repeatDueRule !== -1
+      ? initial.repeatDueRule
+      : today.getDate()
+  );
+
   function submit() {
     if (!name.trim()) return;
+    let repeatDueRule = null;
+    if (repeat === "weekly" && hasRepeatDue) repeatDueRule = repeatDueWeekday;
+    if (repeat === "monthly" && hasRepeatDue) repeatDueRule = repeatDueLastDay ? -1 : (Number(repeatDueDay) || 1);
     onSave({
       name: name.trim(), category, priority, duration: Number(duration) || 15,
       dueDate: hasDue && dueDate ? new Date(dueDate + "T23:59:00").toISOString() : null,
-      repeat,
+      repeat, repeatDueRule,
     });
   }
 
@@ -1381,13 +1460,50 @@ function TaskModal({ initial, onClose, onSave }) {
       <select className="text-input" value={repeat} onChange={e => setRepeat(e.target.value)}>
         {Object.entries(REPEAT_META).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
       </select>
-      {repeat !== "none" && <div className="hint-text">Flexible — Slate fits it in anywhere in the {repeat === "daily" ? "day" : repeat === "weekly" ? "week" : "month"}, wherever there's room.</div>}
 
-      <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
-        <span>Due date</span>
-        <input type="checkbox" checked={hasDue} onChange={e => setHasDue(e.target.checked)} />
-      </label>
-      {hasDue && <input className="text-input" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />}
+      {(repeat === "weekly" || repeat === "monthly") && (
+        <>
+          <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
+            <span>Due on a specific {repeat === "weekly" ? "day of the week" : "day of the month"}</span>
+            <input type="checkbox" checked={hasRepeatDue} onChange={e => setHasRepeatDue(e.target.checked)} />
+          </label>
+          {hasRepeatDue && repeat === "weekly" && (
+            <select className="text-input" value={repeatDueWeekday} onChange={e => setRepeatDueWeekday(Number(e.target.value))}>
+              {DAY_LABELS.map((d, i) => <option key={i} value={i}>{d}</option>)}
+            </select>
+          )}
+          {hasRepeatDue && repeat === "monthly" && (
+            <div className="row-inline">
+              <input
+                className="text-input small" type="number" min={1} max={31}
+                disabled={repeatDueLastDay} value={repeatDueDay}
+                onChange={e => setRepeatDueDay(e.target.value)}
+              />
+              <label className="row-inline" style={{ gap: 6 }}>
+                <input type="checkbox" checked={repeatDueLastDay} onChange={e => setRepeatDueLastDay(e.target.checked)} />
+                <span className="unit-label">Last day of month</span>
+              </label>
+            </div>
+          )}
+        </>
+      )}
+      {repeat !== "none" && (
+        <div className="hint-text">
+          {!hasRepeatDue && `Flexible — Slate fits it in anywhere in the ${repeat === "daily" ? "day" : repeat === "weekly" ? "week" : "month"}, wherever there's room.`}
+          {hasRepeatDue && repeat === "weekly" && `Slate fits it in sometime that week, but flags it if it slips past ${DAY_LABELS[repeatDueWeekday]}.`}
+          {hasRepeatDue && repeat === "monthly" && `Slate fits it in sometime that month, but flags it if it slips past the ${repeatDueLastDay ? "last day" : ordinal(Number(repeatDueDay) || 1)}.`}
+        </div>
+      )}
+
+      {repeat === "none" && (
+        <>
+          <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
+            <span>Due date</span>
+            <input type="checkbox" checked={hasDue} onChange={e => setHasDue(e.target.checked)} />
+          </label>
+          {hasDue && <input className="text-input" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />}
+        </>
+      )}
 
       <div className="modal-actions">
         <button className="secondary-btn" onClick={onClose}>Cancel</button>
