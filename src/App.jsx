@@ -81,13 +81,37 @@ function subtractBusy(freeRanges, busy) {
   return result;
 }
 
-/* next due date after completing a repeating task */
-function nextOccurrence(fromDate, freq) {
-  const base = fromDate ? new Date(fromDate) : new Date();
-  if (freq === "daily") return addDays(base, 1);
-  if (freq === "weekly") return addDays(base, 7);
-  if (freq === "monthly") return addMonthsSafe(base, 1);
-  return null;
+function dayKey(d) { return startOfDay(d).toISOString().slice(0, 10); }
+
+/**
+ * The period windows a repeating task should get a fresh, independent
+ * occurrence for for within [today, today+horizonDays) — one per day for
+ * "daily", one per rolling 7-day chunk for "weekly", one per ~month for
+ * "monthly". Each period gets its own occurrenceKey so it can be completed,
+ * dragged, or left unscheduled independently of every other period.
+ */
+function periodsFor(repeat, today, horizonDays) {
+  const periods = [];
+  if (repeat === "daily") {
+    for (let i = 0; i < horizonDays; i++) {
+      const start = addDays(today, i);
+      periods.push({ start, end: addDays(start, 1), key: `d:${dayKey(start)}` });
+    }
+  } else if (repeat === "weekly") {
+    for (let i = 0; i < horizonDays; i += 7) {
+      const start = addDays(today, i);
+      periods.push({ start, end: addDays(start, 7), key: `w:${dayKey(start)}` });
+    }
+  } else if (repeat === "monthly") {
+    let start = today, guard = 0;
+    while (start < addDays(today, horizonDays) && guard < 12) {
+      const end = addMonthsSafe(start, 1);
+      periods.push({ start, end, key: `m:${dayKey(start)}` });
+      start = end;
+      guard++;
+    }
+  }
+  return periods;
 }
 
 /* ============================ scheduling engine ========================== */
@@ -103,8 +127,9 @@ function nextOccurrence(fromDate, freq) {
  *   trying slots after the due date (within the horizon) and flags it
  *   "overdue" so the UI can call it out.
  */
-function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK }) {
+function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges }) {
   const today = startOfDay(new Date());
+  const doneSet = new Set(completedOccurrences || []);
 
   const expandedBlocked = [];
   for (const be of blockedEvents) {
@@ -133,17 +158,36 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
     }
   }
 
+  // build one instance per task (non-repeating) or one per period within the
+  // horizon (repeating) — each independently schedulable, lockable, and
+  // completable, so a daily task actually gets a fresh block every day
+  // instead of a single occurrence for the whole week.
   const instances = [];
   for (const t of tasks) {
-    if (t.completed) continue;
-    const lockedForTask = lockedBlocks.filter(b => b.taskId === t.id);
-    const lockedMinutes = lockedForTask.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
-    const remaining = Math.max(0, t.duration - lockedMinutes);
-    if (remaining <= 0) continue;
-    instances.push({
-      taskId: t.id, name: t.name, category: t.category, priority: t.priority,
-      due: t.dueDate ? new Date(t.dueDate) : null, remaining,
-    });
+    if (t.repeat === "none" || !t.repeat) {
+      if (t.completed) continue;
+      const lockedForOcc = lockedBlocks.filter(b => b.taskId === t.id && !b.occurrenceKey);
+      const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
+      const remaining = Math.max(0, t.duration - lockedMinutes);
+      if (remaining <= 0) continue;
+      instances.push({
+        taskId: t.id, occurrenceKey: null, name: t.name, category: t.category, priority: t.priority,
+        due: t.dueDate ? new Date(t.dueDate) : null, remaining,
+      });
+    } else {
+      for (const p of periodsFor(t.repeat, today, horizonDays)) {
+        const occurrenceKey = `${t.id}::${p.key}`;
+        if (doneSet.has(occurrenceKey)) continue;
+        const lockedForOcc = lockedBlocks.filter(b => b.occurrenceKey === occurrenceKey);
+        const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
+        const remaining = Math.max(0, t.duration - lockedMinutes);
+        if (remaining <= 0) continue;
+        instances.push({
+          taskId: t.id, occurrenceKey, name: t.name, category: t.category, priority: t.priority,
+          due: p.end, periodStart: p.start, remaining,
+        });
+      }
+    }
   }
 
   instances.sort((a, b) => {
@@ -161,10 +205,24 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
 
   for (const inst of instances) {
     let remaining = inst.remaining;
-    const dueIdx = inst.due ? Math.floor((startOfDay(inst.due) - today) / (24 * 60 * MIN_MS)) : horizonDays - 1;
+    const startIdx = inst.periodStart ? Math.max(0, Math.floor((startOfDay(inst.periodStart) - today) / (24 * 60 * MIN_MS))) : 0;
+    // `due` marks the EXCLUSIVE end of a recurring instance's period (e.g. a
+    // daily period's due is midnight of the *next* day) — convert that to the
+    // last day index actually inside the period, or the loop below would
+    // wrongly reach one day past it (this is what let a Sunday occurrence
+    // spill over onto Monday).
+    const dueIdx = inst.periodStart
+      ? startIdx + Math.round((inst.due - inst.periodStart) / (24 * 60 * MIN_MS)) - 1
+      : (inst.due ? Math.floor((startOfDay(inst.due) - today) / (24 * 60 * MIN_MS)) : horizonDays - 1);
+    // recurring occurrences stay within their own day/week/month — if a given
+    // day has no room (e.g. a work task on a day with no work hours), that
+    // day's instance is simply missed rather than piling onto a later day.
+    // Non-repeating tasks still get the "search after the due date" fallback,
+    // since finishing a one-off task late generally beats not at all.
+    const maxPass = inst.occurrenceKey ? 1 : 2;
     let segIndex = 0;
-    for (let pass = 0; pass < 2 && remaining > 0; pass++) {
-      const startI = pass === 0 ? 0 : Math.max(0, dueIdx + 1);
+    for (let pass = 0; pass < maxPass && remaining > 0; pass++) {
+      const startI = pass === 0 ? startIdx : Math.max(startIdx, dueIdx + 1);
       const endI = pass === 0 ? Math.min(dueIdx, horizonDays - 1) : horizonDays - 1;
       if (startI > endI) continue;
       for (let i = startI; i <= endI && remaining > 0; i++) {
@@ -179,8 +237,8 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
           const blockEnd = addMinutes(blockStart, take);
           segIndex += 1;
           autoBlocks.push({
-            id: `auto-${inst.taskId}-${blockStart.getTime()}`,
-            taskId: inst.taskId, name: inst.name, category: inst.category,
+            id: `auto-${inst.taskId}-${inst.occurrenceKey || "x"}-${blockStart.getTime()}`,
+            taskId: inst.taskId, occurrenceKey: inst.occurrenceKey, name: inst.name, category: inst.category,
             start: blockStart, end: blockEnd, locked: false, segIndex,
           });
           remaining -= take;
@@ -192,10 +250,14 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, priva
     if (remaining > 0) unscheduled.add(inst.taskId);
   }
 
-  // total segment counts, filled in after the fact
-  const totalByTask = {};
-  for (const b of autoBlocks) totalByTask[b.taskId] = (totalByTask[b.taskId] || 0) + 1;
-  for (const b of autoBlocks) b.segTotal = totalByTask[b.taskId];
+  // total segment counts, grouped per occurrence (so each day of a daily
+  // task counts its own segments, rather than lumping the whole week together)
+  const totalByGroup = {};
+  for (const b of autoBlocks) {
+    const g = b.occurrenceKey || b.taskId;
+    totalByGroup[g] = (totalByGroup[g] || 0) + 1;
+  }
+  for (const b of autoBlocks) b.segTotal = totalByGroup[b.occurrenceKey || b.taskId];
 
   return { autoBlocks, expandedBlocked, overdue: [...overdue], unscheduled: [...unscheduled] };
 }
@@ -254,7 +316,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.17-10";
+const BUILD_TAG = "2026.08.18-12";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -353,6 +415,18 @@ function clearDriveSession() {
   try { window.sessionStorage.removeItem(DRIVE_SESSION_KEY); } catch (e) { /* ignore */ }
 }
 
+/* which occurrence of a repeating task "today" (or this week/month) counts
+   as, for the sidebar's simple checkbox — matches the i=0 period computeSchedule
+   generates, so ticking it here lines up with today's calendar block */
+function currentPeriodKeyFor(task, refDate) {
+  if (!task.repeat || task.repeat === "none") return null;
+  const today = startOfDay(refDate);
+  if (task.repeat === "daily") return `${task.id}::d:${dayKey(today)}`;
+  if (task.repeat === "weekly") return `${task.id}::w:${dayKey(today)}`;
+  if (task.repeat === "monthly") return `${task.id}::m:${dayKey(today)}`;
+  return null;
+}
+
 /* =================================== app =================================== */
 
 export default function App() {
@@ -363,6 +437,7 @@ export default function App() {
   const [workRanges, setWorkRanges] = useState({});
   const [privateRanges, setPrivateRanges] = useState({});
   const [completionLog, setCompletionLog] = useState([]); // history of completions, for the weekly review
+  const [completedOccurrences, setCompletedOccurrences] = useState([]); // which specific periods of repeating tasks are done, e.g. "taskId::d:2026-08-17"
 
   const [weekStartOffset, setWeekStartOffset] = useState(0); // in days
   const [taskModal, setTaskModal] = useState(null); // null | 'new' | task object
@@ -409,13 +484,14 @@ export default function App() {
   /* ---- load once ---- */
   useEffect(() => {
     (async () => {
-      const [t, be, lb, wr, pr, cl, hle, lua] = await Promise.all([
+      const [t, be, lb, wr, pr, cl, co, hle, lua] = await Promise.all([
         loadKey("tasks", null),
         loadKey("blockedEvents", null),
         loadKey("lockedBlocks", null),
         loadKey("workRanges", null),
         loadKey("privateRanges", null),
         loadKey("completionLog", null),
+        loadKey("completedOccurrences", null),
         loadKey("hasLocalEdits", false),
         loadKey("localUpdatedAt", null),
       ]);
@@ -425,6 +501,7 @@ export default function App() {
       setWorkRanges(wr || seedWorkRanges());
       setPrivateRanges(pr || seedPrivateRanges());
       setCompletionLog(cl || []);
+      setCompletedOccurrences(co || []);
       setHasLocalEdits(hle);
       setLocalUpdatedAt(lua);
       setReady(true);
@@ -438,6 +515,7 @@ export default function App() {
   useEffect(() => { if (ready) saveKey("workRanges", workRanges); }, [workRanges, ready]);
   useEffect(() => { if (ready) saveKey("privateRanges", privateRanges); }, [privateRanges, ready]);
   useEffect(() => { if (ready) saveKey("completionLog", completionLog); }, [completionLog, ready]);
+  useEffect(() => { if (ready) saveKey("completedOccurrences", completedOccurrences); }, [completedOccurrences, ready]);
   useEffect(() => { if (ready) saveKey("hasLocalEdits", hasLocalEdits); }, [hasLocalEdits, ready]);
   useEffect(() => { if (ready) saveKey("localUpdatedAt", localUpdatedAt); }, [localUpdatedAt, ready]);
 
@@ -451,7 +529,7 @@ export default function App() {
     setHasLocalEdits(true);
     setLocalUpdatedAt(new Date().toISOString());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, ready]);
+  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, completedOccurrences, ready]);
 
   /* ---- undo keyboard shortcut (Ctrl/Cmd+Z) ---- */
   useEffect(() => {
@@ -475,15 +553,15 @@ export default function App() {
   /* ---- scheduling (recomputed whenever inputs change) ---- */
   const schedule = useMemo(() => {
     if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [] };
-    return computeSchedule({ tasks, blockedEvents, lockedBlocks, workRanges, privateRanges });
-  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, ready]);
+    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges });
+  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, ready]);
 
   const tasksById = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
 
   const allBlocks = useMemo(() => {
     const locked = lockedBlocks.map(b => {
       const t = tasksById[b.taskId];
-      return { id: b.id, taskId: b.taskId, name: t ? t.name : "(deleted task)", category: t ? t.category : "work", start: new Date(b.start), end: new Date(b.end), locked: true, segIndex: 1, segTotal: 1 };
+      return { id: b.id, taskId: b.taskId, occurrenceKey: b.occurrenceKey || null, name: t ? t.name : "(deleted task)", category: t ? t.category : "work", start: new Date(b.start), end: new Date(b.end), locked: true, segIndex: 1, segTotal: 1 };
     });
     return [...locked, ...schedule.autoBlocks];
   }, [lockedBlocks, schedule.autoBlocks, tasksById]);
@@ -501,29 +579,36 @@ export default function App() {
     setLockedBlocks(prev => prev.filter(b => b.taskId !== id));
     showToast("Task deleted");
   }
-  function toggleComplete(task) {
+  function toggleComplete(task, occurrenceKey) {
+    if (task.repeat && task.repeat !== "none") {
+      const key = occurrenceKey || currentPeriodKeyFor(task, now);
+      if (completedOccurrences.includes(key)) {
+        setCompletedOccurrences(prev => prev.filter(k => k !== key));
+      } else {
+        setCompletingTask({ task, occurrenceKey: key });
+      }
+      return;
+    }
     if (!task.completed) {
       // completing now — ask how long it actually took before logging it
-      setCompletingTask(task);
+      setCompletingTask({ task, occurrenceKey: null });
     } else {
       // un-completing — just flip it back, no need to touch the log
       setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, completed: false } : t)));
     }
   }
 
-  function confirmComplete(task, actualDuration) {
-    setLockedBlocks(prev => prev.filter(b => b.taskId !== task.id)); // free up any locked slots for this occurrence
+  function confirmComplete(task, occurrenceKey, actualDuration) {
     setCompletionLog(prev => [...prev, {
       id: uid(), taskId: task.id, name: task.name, category: task.category, priority: task.priority,
       estimatedDuration: task.duration, actualDuration, completedAt: new Date().toISOString(),
     }]);
-    if (task.repeat !== "none") {
-      const nextDue = nextOccurrence(task.dueDate || new Date(), task.repeat);
-      setTasks(prev => prev.map(t => (t.id === task.id ? {
-        ...t, completed: false, lastCompletedAt: new Date().toISOString(), dueDate: nextDue.toISOString(),
-      } : t)));
-      showToast(`Nice work! Next "${task.name}" queued for ${monthDayLabel(nextDue)}`);
+    if (task.repeat && task.repeat !== "none") {
+      setLockedBlocks(prev => prev.filter(b => b.occurrenceKey !== occurrenceKey)); // free up any locked slot for just this occurrence
+      setCompletedOccurrences(prev => [...prev, occurrenceKey]);
+      showToast(`Nice work! "${task.name}" is done for this period — it'll come back next time around`);
     } else {
+      setLockedBlocks(prev => prev.filter(b => b.taskId !== task.id));
       setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, completed: true, lastCompletedAt: new Date().toISOString() } : t)));
       showToast(`Marked "${task.name}" complete — rescheduling the rest of your week`);
     }
@@ -561,7 +646,7 @@ export default function App() {
     const newEnd = addMinutes(newStart, durationMin);
     setLockedBlocks(prev => {
       const withoutThis = prev.filter(b => b.id !== block.id);
-      return [...withoutThis, { id: block.locked ? block.id : uid(), taskId: block.taskId, start: newStart.toISOString(), end: newEnd.toISOString() }];
+      return [...withoutThis, { id: block.locked ? block.id : uid(), taskId: block.taskId, occurrenceKey: block.occurrenceKey || null, start: newStart.toISOString(), end: newEnd.toISOString() }];
     });
     showToast("Block moved — everything else adjusted around it");
   }
@@ -573,7 +658,7 @@ export default function App() {
 
   /* ---- google drive sync ---- */
   function buildSyncPayload() {
-    return { tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, updatedAt: new Date().toISOString() };
+    return { tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, completedOccurrences, updatedAt: new Date().toISOString() };
   }
   function applyDriveData(data) {
     if (Array.isArray(data.tasks)) setTasks(data.tasks);
@@ -582,6 +667,7 @@ export default function App() {
     if (data.workRanges) setWorkRanges(data.workRanges);
     if (data.privateRanges) setPrivateRanges(data.privateRanges);
     if (Array.isArray(data.completionLog)) setCompletionLog(data.completionLog);
+    if (Array.isArray(data.completedOccurrences)) setCompletedOccurrences(data.completedOccurrences);
   }
 
   function connectDrive() {
@@ -628,7 +714,13 @@ export default function App() {
       }
 
       const driveData = await driveReadFile(token, file.id);
-      const driveHasData = driveData && Array.isArray(driveData.tasks) && driveData.tasks.length > 0;
+      // "Has this file ever been really synced?" should be based on whether it
+      // was ever actually written by the app (it always carries an updatedAt
+      // stamp when it has), NOT on whether tasks happens to be non-empty right
+      // now — a legitimately-synced file can validly have zero tasks in it
+      // (e.g. everything got completed elsewhere), and treating that as "blank,
+      // nothing to lose" was exactly what caused silent overwrites.
+      const driveHasData = !!(driveData && typeof driveData === "object" && driveData.updatedAt);
       console.log("[Slate/Drive] connect: driveData =", driveData, "driveHasData =", driveHasData);
 
       if (!driveHasData) {
@@ -655,7 +747,8 @@ export default function App() {
       const sameContent =
         JSON.stringify(driveData.tasks) === JSON.stringify(localPayload.tasks) &&
         JSON.stringify(driveData.blockedEvents) === JSON.stringify(localPayload.blockedEvents) &&
-        JSON.stringify(driveData.completionLog) === JSON.stringify(localPayload.completionLog);
+        JSON.stringify(driveData.completionLog) === JSON.stringify(localPayload.completionLog) &&
+        JSON.stringify(driveData.completedOccurrences) === JSON.stringify(localPayload.completedOccurrences);
       console.log("[Slate/Drive] connect: sameContent =", sameContent);
 
       if (sameContent) {
@@ -724,7 +817,7 @@ export default function App() {
     }, 2000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, drive.status, drive.fileId]);
+  }, [tasks, blockedEvents, lockedBlocks, workRanges, privateRanges, completionLog, completedOccurrences, drive.status, drive.fileId]);
 
   // remember this connection across a page refresh, so reloading resumes
   // instead of forcing a full reconnect
@@ -824,6 +917,8 @@ export default function App() {
     onEditTask: (t) => { setTaskModal(t); setMobileTasksOpen(false); },
     onDeleteTask: deleteTask,
     onToggleComplete: toggleComplete,
+    completedOccurrences,
+    now,
     blockedEvents,
     onAddBlocked: () => { setBlockedModal("new"); setMobileTasksOpen(false); },
     onEditBlocked: (e) => { setBlockedModal(e); setMobileTasksOpen(false); },
@@ -873,7 +968,7 @@ export default function App() {
           overdueIds={schedule.overdue}
           onDropBlock={lockBlockAt}
           onUnlockBlock={unlockBlock}
-          onToggleComplete={(taskId) => { const t = tasksById[taskId]; if (t) toggleComplete(t); }}
+          onToggleComplete={(taskId, occurrenceKey) => { const t = tasksById[taskId]; if (t) toggleComplete(t, occurrenceKey); }}
           onEditTask={(taskId) => { const t = tasksById[taskId]; if (t) setTaskModal(t); }}
           now={now}
         />
@@ -909,9 +1004,9 @@ export default function App() {
 
       {completingTask && (
         <CompleteModal
-          task={completingTask}
+          task={completingTask.task}
           onClose={() => setCompletingTask(null)}
-          onConfirm={(actualDuration) => confirmComplete(completingTask, actualDuration)}
+          onConfirm={(actualDuration) => confirmComplete(completingTask.task, completingTask.occurrenceKey, actualDuration)}
         />
       )}
 
@@ -994,7 +1089,7 @@ function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTa
 function Sidebar({
   tasks, overdueIds, unscheduledIds, categoryFilter, setCategoryFilter, search, setSearch,
   showCompleted, setShowCompleted, onAddTask, onEditTask, onDeleteTask, onToggleComplete,
-  blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked,
+  blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked, completedOccurrences, now,
 }) {
   return (
     <div className="sidebar">
@@ -1027,9 +1122,11 @@ function Sidebar({
             key={t.id} task={t}
             isOverdue={overdueIds.includes(t.id)}
             isUnscheduled={unscheduledIds.includes(t.id)}
+            completedOccurrences={completedOccurrences}
+            now={now}
             onEdit={() => onEditTask(t)}
             onDelete={() => onDeleteTask(t.id)}
-            onToggle={() => onToggleComplete(t)}
+            onToggle={() => onToggleComplete(t, currentPeriodKeyFor(t, now))}
           />
         ))}
 
@@ -1055,22 +1152,26 @@ function Sidebar({
   );
 }
 
-function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle }) {
+function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, completedOccurrences, now }) {
   const cat = CATEGORY_META[task.category];
   const pri = PRIORITY_META[task.priority];
   const Icon = cat.icon;
+  const isRepeating = task.repeat && task.repeat !== "none";
+  const currentKey = isRepeating ? currentPeriodKeyFor(task, now) : null;
+  const isDone = isRepeating ? (completedOccurrences || []).includes(currentKey) : task.completed;
   return (
-    <div className={`task-row ${task.completed ? "task-row-done" : ""}`}>
+    <div className={`task-row ${isDone ? "task-row-done" : ""}`}>
       <button className="check-btn" onClick={onToggle} style={{ "--pc": pri.color }}>
-        {task.completed && <Check size={12} />}
+        {isDone && <Check size={12} />}
       </button>
       <div className="task-info" onClick={onEdit}>
         <div className="task-name">{task.name}</div>
         <div className="task-meta">
           <span className="meta-chip" style={{ color: cat.accent }}><Icon size={11} /> {cat.label}</span>
           <span className="meta-chip"><Clock size={11} /> {formatDuration(task.duration)}</span>
-          {task.repeat !== "none" && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
-          {task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
+          {isRepeating && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
+          {isRepeating && isDone && <span className="meta-chip">Done for now{task.repeat === "daily" ? " — back tomorrow" : task.repeat === "weekly" ? " — back next week" : " — back next month"}</span>}
+          {!isRepeating && task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
           {isOverdue && <span className="meta-chip meta-warn"><AlertTriangle size={11} /> At risk</span>}
           {isUnscheduled && <span className="meta-chip meta-danger"><AlertTriangle size={11} /> Won't fit</span>}
         </div>
@@ -1208,7 +1309,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
                         {risky && <AlertTriangle size={11} className="risk-flag" />}
                       </div>
                       <div className="task-block-actions">
-                        <button onClick={(e) => { e.stopPropagation(); onToggleComplete(b.taskId); }} title="Mark complete"><Check size={11} /></button>
+                        <button onClick={(e) => { e.stopPropagation(); onToggleComplete(b.taskId, b.occurrenceKey); }} title="Mark complete"><Check size={11} /></button>
                         {b.locked && <button onClick={(e) => { e.stopPropagation(); onUnlockBlock(b); }} title="Reset to auto-schedule"><RotateCcw size={11} /></button>}
                       </div>
                     </div>
