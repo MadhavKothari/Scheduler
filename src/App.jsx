@@ -254,7 +254,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.17-9";
+const BUILD_TAG = "2026.08.17-10";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -446,7 +446,8 @@ export default function App() {
   // run right after loading, so simply opening the app doesn't count as an edit
   useEffect(() => {
     if (!ready) return;
-    if (skipNextEditMarkRef.current) { skipNextEditMarkRef.current = false; return; }
+    if (skipNextEditMarkRef.current) { skipNextEditMarkRef.current = false; console.log("[Slate/Drive] initial load — not marking as edited"); return; }
+    console.log("[Slate/Drive] marking this device as having real edits, task count =", tasks.length);
     setHasLocalEdits(true);
     setLocalUpdatedAt(new Date().toISOString());
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -614,9 +615,12 @@ export default function App() {
     try {
       let file = await driveFindFile(token);
       const localPayload = buildSyncPayload();
+      console.log("[Slate/Drive] connect: file found?", !!file, file);
+      console.log("[Slate/Drive] connect: hasLocalEdits =", hasLocalEdits, "local task count =", localPayload.tasks.length);
 
       if (!file) {
         file = await driveCreateFile(token, localPayload);
+        console.log("[Slate/Drive] branch: created new file (none existed)", file.id);
         lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
         showToast("Connected — this device's schedule is now on Drive");
@@ -625,9 +629,11 @@ export default function App() {
 
       const driveData = await driveReadFile(token, file.id);
       const driveHasData = driveData && Array.isArray(driveData.tasks) && driveData.tasks.length > 0;
+      console.log("[Slate/Drive] connect: driveData =", driveData, "driveHasData =", driveHasData);
 
       if (!driveHasData) {
         // Drive file exists but is empty/blank — nothing to lose, just push this device's data
+        console.log("[Slate/Drive] branch: drive file had no real data, pushing local");
         await driveWriteFile(token, file.id, localPayload);
         lastKnownDriveUpdatedAtRef.current = localPayload.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
@@ -638,6 +644,7 @@ export default function App() {
       if (!hasLocalEdits) {
         // this device has nothing of its own worth keeping yet (still just the
         // starter tasks, or truly untouched) — adopt Drive's real schedule, no prompt needed
+        console.log("[Slate/Drive] branch: no local edits, pulling from Drive");
         applyDriveData(driveData);
         lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
         setDrive({ status: "connected", fileId: file.id, lastSyncedAt: new Date().toISOString(), error: null });
@@ -649,6 +656,7 @@ export default function App() {
         JSON.stringify(driveData.tasks) === JSON.stringify(localPayload.tasks) &&
         JSON.stringify(driveData.blockedEvents) === JSON.stringify(localPayload.blockedEvents) &&
         JSON.stringify(driveData.completionLog) === JSON.stringify(localPayload.completionLog);
+      console.log("[Slate/Drive] connect: sameContent =", sameContent);
 
       if (sameContent) {
         lastKnownDriveUpdatedAtRef.current = driveData.updatedAt;
@@ -658,9 +666,11 @@ export default function App() {
       }
 
       // both sides have real, different data — let the person choose, rather than guessing
+      console.log("[Slate/Drive] branch: showing conflict dialog");
       setDriveConflict({ fileId: file.id, driveData, localPayload, token });
       setDrive(d => ({ ...d, status: "connecting" }));
     } catch (e) {
+      console.log("[Slate/Drive] connect: threw an error", e);
       setDrive(d => ({ ...d, status: "error", error: e.message }));
     }
   }
