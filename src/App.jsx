@@ -188,8 +188,24 @@ function periodsFor(repeat, today, horizonDays, dueRule) {
  *   trying slots after the due date (within the horizon) and flags it
  *   "overdue" so the UI can call it out.
  */
-function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges }) {
-  const today = startOfDay(new Date());
+/**
+ * Clip a day's available ranges so nothing before `now` counts as free —
+ * otherwise the greedy auto-scheduler (which always fills the earliest open
+ * slot) will happily backfill tasks into today's already-passed hours the
+ * moment anything reshuffles (e.g. completing a task frees up a later slot,
+ * pulling a subsequent task earlier into a slot that's since become past).
+ * Rounds up to the next 15-minute mark so newly-opened slots land on a clean
+ * boundary instead of "right now, down to the second".
+ */
+function clipRangesToNow(ranges, now) {
+  const cutoff = new Date(Math.ceil(now.getTime() / (15 * MIN_MS)) * (15 * MIN_MS));
+  return ranges
+    .map(r => (r.start < cutoff ? { start: cutoff, end: r.end } : r))
+    .filter(r => r.end > r.start);
+}
+
+function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges, now = new Date() }) {
+  const today = startOfDay(now);
   const doneSet = new Set(completedOccurrences || []);
 
   const expandedBlocked = [];
@@ -213,7 +229,8 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
   for (let i = 0; i < horizonDays; i++) {
     const day = addDays(today, i);
     for (const category of ["work", "private"]) {
-      const ranges = rangesForDay(day, category === "work" ? workRanges : privateRanges);
+      let ranges = rangesForDay(day, category === "work" ? workRanges : privateRanges);
+      if (i === 0) ranges = clipRangesToNow(ranges, now);
       const busy = [...expandedBlocked, ...lockedRanges];
       freeMap[`${i}-${category}`] = subtractBusy(ranges, busy);
     }
@@ -377,7 +394,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-14";
+const BUILD_TAG = "2026.08.18-15";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -612,11 +629,13 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), 3200);
   }
 
-  /* ---- scheduling (recomputed whenever inputs change) ---- */
+  /* ---- scheduling (recomputed whenever inputs change, or the clock ticks
+     past a 15-min boundary — see `now` below — so today's already-passed
+     hours never get reclaimed as free by the auto-scheduler) ---- */
   const schedule = useMemo(() => {
     if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [] };
-    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges });
-  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, ready]);
+    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now });
+  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now, ready]);
 
   const tasksById = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
 
