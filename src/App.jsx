@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
-  Plus, X, Check, Trash2, Settings, ChevronLeft, ChevronRight, Repeat,
-  Briefcase, Home, AlertTriangle, Ban, Search, RotateCcw, Clock, Flame,
+  Plus, X, Check, Trash2, Settings, ChevronLeft, ChevronRight, ChevronDown, Repeat,
+  Briefcase, Home, AlertTriangle, Ban, Search, RotateCcw, Clock, Flame, Link2,
   CalendarDays, GripVertical, Undo2, BarChart3, CheckCircle2, Cloud, CloudOff
 } from "lucide-react";
 
@@ -22,6 +22,55 @@ const PRIORITY_META = {
   medium: { label: "Medium", weight: 2, color: "#FFD166" },
   low:    { label: "Low",    weight: 1, color: "#6BCB77" },
 };
+
+/* ---- color helpers (per-task custom calendar-block color) ---- */
+
+function hexToRgb(hex) {
+  const clean = hex.replace("#", "");
+  const full = clean.length === 3 ? clean.split("").map(c => c + c).join("") : clean;
+  const num = parseInt(full, 16);
+  return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
+}
+function hexToRgba(hex, alpha) {
+  const { r, g, b } = hexToRgb(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const toHex = x => Math.round(255 * x).toString(16).padStart(2, "0");
+  return `#${toHex(f(0))}${toHex(f(8))}${toHex(f(4))}`;
+}
+function hexToHsl(hex) {
+  const { r, g, b } = hexToRgb(hex);
+  const rn = r / 255, gn = g / 255, bn = b / 255;
+  const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
+  let h, s, l = (max + min) / 2;
+  if (max === min) { h = 0; s = 0; }
+  else {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case rn: h = (gn - bn) / d + (gn < bn ? 6 : 0); break;
+      case gn: h = (bn - rn) / d + 2; break;
+      default: h = (rn - gn) / d + 4;
+    }
+    h *= 60;
+  }
+  return { h, s: s * 100, l: l * 100 };
+}
+/* the effective accent/tint a calendar block should render with — a task's
+   own `color` (if set) overrides the category default, keeping the same
+   lighter-border/darker-center tint treatment either way. With no custom
+   color, this is just the existing category default (blue for work, purple
+   for private). */
+function colorFor(category, color) {
+  const cat = CATEGORY_META[category];
+  if (color) return { accent: color, tint: hexToRgba(color, 0.16) };
+  return { accent: cat.accent, tint: cat.tint };
+}
 
 const CATEGORY_META = {
   work:    { label: "Work",    accent: "#5B8DEF", tint: "rgba(91,141,239,0.16)", icon: Briefcase },
@@ -204,9 +253,36 @@ function clipRangesToNow(ranges, now) {
     .filter(r => r.end > r.start);
 }
 
+/**
+ * A task can depend on exactly one other task (`dependsOn`, a task id) —
+ * "schedule this only after that one". This computes each task's dependency
+ * depth (0 = no dependency, or the one it depends on doesn't exist), which
+ * is used to force whole-task processing order in the scheduler: every
+ * instance of a depth-0 task is scheduled before ANY instance of a depth-1
+ * task that depends on it, etc. — overriding priority, since "must come
+ * after" is a hard constraint and priority is only a tie-breaker among
+ * otherwise-independent tasks. Self-references and dependency cycles are
+ * broken (treated as depth 0) rather than looping forever or deadlocking.
+ */
+function dependencyDepth(taskId, tasksById, memo, visiting) {
+  if (memo.has(taskId)) return memo.get(taskId);
+  const t = tasksById[taskId];
+  const dep = t && t.dependsOn;
+  if (!dep || !tasksById[dep] || dep === taskId || visiting.has(taskId)) {
+    memo.set(taskId, 0);
+    return 0;
+  }
+  visiting.add(taskId);
+  const depth = dependencyDepth(dep, tasksById, memo, visiting) + 1;
+  visiting.delete(taskId);
+  memo.set(taskId, depth);
+  return depth;
+}
+
 function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges, now = new Date() }) {
   const today = startOfDay(now);
   const doneSet = new Set(completedOccurrences || []);
+  const tasksById = Object.fromEntries(tasks.map(t => [t.id, t]));
 
   const expandedBlocked = [];
   for (const be of blockedEvents) {
@@ -236,6 +312,33 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
     }
   }
 
+  // per-task, per-day "readiness" — the latest known end time for that task
+  // on that day, whether from a real scheduled block or a manually-completed
+  // occurrence. A dependent task's search on a given day is clipped to not
+  // start before its dependency's readiness time that same day; if the
+  // dependency has no readiness at all through that day, the day is fully
+  // off-limits for the dependent (it truly can't come before its prerequisite).
+  const readyByDay = {};
+  function markReady(taskId, date) {
+    if (!readyByDay[taskId]) readyByDay[taskId] = new Array(horizonDays).fill(null);
+    const di = Math.floor((startOfDay(date) - today) / (24 * 60 * MIN_MS));
+    if (di < 0 || di >= horizonDays) return;
+    const existing = readyByDay[taskId][di];
+    if (existing == null || date > existing) readyByDay[taskId][di] = date;
+  }
+  function readyBoundForDay(depTaskId, dayIndex) {
+    const depTask = tasksById[depTaskId];
+    if (!depTask) return today; // dependency task no longer exists — treat as satisfied
+    if ((!depTask.repeat || depTask.repeat === "none") && depTask.completed) return today; // already done — satisfied, no constraint
+    const arr = readyByDay[depTaskId];
+    let bound = null;
+    for (let d = 0; d <= dayIndex; d++) { if (arr && arr[d] != null) bound = arr[d]; }
+    return bound; // null => this task hasn't been ready on or before this day yet
+  }
+
+  const depthMemo = new Map();
+  const rankOf = taskId => dependencyDepth(taskId, tasksById, depthMemo, new Set());
+
   // build one instance per task (non-repeating) or one per period within the
   // horizon (repeating) — each independently schedulable, lockable, and
   // completable, so a daily task actually gets a fresh block every day
@@ -250,25 +353,32 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
       if (remaining <= 0) continue;
       instances.push({
         taskId: t.id, occurrenceKey: null, name: t.name, category: t.category, priority: t.priority,
-        due: t.dueDate ? new Date(t.dueDate) : null, remaining,
+        due: t.dueDate ? new Date(t.dueDate) : null, remaining, color: t.color || null, dependsOn: t.dependsOn || null,
       });
     } else {
       for (const p of periodsFor(t.repeat, today, horizonDays, t.repeatDueRule)) {
         const occurrenceKey = `${t.id}::${p.key}`;
-        if (doneSet.has(occurrenceKey)) continue;
+        if (doneSet.has(occurrenceKey)) {
+          markReady(t.id, p.start); // manually completed without ever getting a real block — still counts as "ready" from that period on
+          continue;
+        }
         const lockedForOcc = lockedBlocks.filter(b => b.occurrenceKey === occurrenceKey);
         const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
         const remaining = Math.max(0, t.duration - lockedMinutes);
         if (remaining <= 0) continue;
         instances.push({
           taskId: t.id, occurrenceKey, name: t.name, category: t.category, priority: t.priority,
-          due: p.end, periodStart: p.start, remaining,
+          due: p.end, periodStart: p.start, remaining, color: t.color || null, dependsOn: t.dependsOn || null,
         });
       }
     }
   }
 
   instances.sort((a, b) => {
+    // dependency order always wins — every instance of a task's prerequisite
+    // is scheduled before any instance of the dependent task, full stop.
+    const ra = rankOf(a.taskId), rb = rankOf(b.taskId);
+    if (ra !== rb) return ra - rb;
     const pw = PRIORITY_META[b.priority].weight - PRIORITY_META[a.priority].weight;
     if (pw !== 0) return pw;
     if (a.due && b.due) return a.due - b.due;
@@ -280,6 +390,7 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
   const autoBlocks = [];
   const overdue = new Set();
   const unscheduled = new Set();
+  const blockedByDependency = new Set(); // tasks currently unschedulable purely because their prerequisite isn't ready yet
 
   for (const inst of instances) {
     let remaining = inst.remaining;
@@ -299,33 +410,53 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
     // since finishing a one-off task late generally beats not at all.
     const maxPass = inst.occurrenceKey ? 1 : 2;
     let segIndex = 0;
+    let everBlockedByDependency = false;
     for (let pass = 0; pass < maxPass && remaining > 0; pass++) {
       const startI = pass === 0 ? startIdx : Math.max(startIdx, dueIdx + 1);
       const endI = pass === 0 ? Math.min(dueIdx, horizonDays - 1) : horizonDays - 1;
       if (startI > endI) continue;
       for (let i = startI; i <= endI && remaining > 0; i++) {
+        let dayBound = null;
+        if (inst.dependsOn) {
+          dayBound = readyBoundForDay(inst.dependsOn, i);
+          if (dayBound === null) { everBlockedByDependency = true; continue; } // prerequisite not ready by this day at all — skip it entirely
+        }
         const key = `${i}-${inst.category}`;
         const free = freeMap[key];
         for (let s = 0; s < free.length && remaining > 0; s++) {
           const slot = free[s];
-          const slotMin = (slot.end - slot.start) / MIN_MS;
+          const effectiveStart = dayBound && dayBound > slot.start ? dayBound : slot.start;
+          const slotMin = (slot.end - effectiveStart) / MIN_MS;
+          if (slotMin <= 0) continue;
           if (slotMin < Math.min(minChunk, remaining)) continue;
           const take = Math.min(slotMin, remaining);
-          const blockStart = slot.start;
+          const blockStart = effectiveStart;
           const blockEnd = addMinutes(blockStart, take);
           segIndex += 1;
           autoBlocks.push({
             id: `auto-${inst.taskId}-${inst.occurrenceKey || "x"}-${blockStart.getTime()}`,
             taskId: inst.taskId, occurrenceKey: inst.occurrenceKey, name: inst.name, category: inst.category,
-            start: blockStart, end: blockEnd, locked: false, segIndex,
+            color: inst.color, start: blockStart, end: blockEnd, locked: false, segIndex,
           });
           remaining -= take;
-          free[s] = { start: blockEnd, end: slot.end };
+          markReady(inst.taskId, blockEnd);
+          if (effectiveStart > slot.start) {
+            // dependency clipping ate into the front of this slot — the time
+            // before the cutoff is still genuinely free for OTHER tasks, so
+            // split it out instead of discarding it.
+            free.splice(s, 1, { start: slot.start, end: effectiveStart }, { start: blockEnd, end: slot.end });
+            s++;
+          } else {
+            free[s] = { start: blockEnd, end: slot.end };
+          }
         }
       }
       if (remaining > 0 && inst.due) overdue.add(inst.taskId);
     }
-    if (remaining > 0) unscheduled.add(inst.taskId);
+    if (remaining > 0) {
+      unscheduled.add(inst.taskId);
+      if (everBlockedByDependency) blockedByDependency.add(inst.taskId);
+    }
   }
 
   // total segment counts, grouped per occurrence (so each day of a daily
@@ -337,7 +468,7 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
   }
   for (const b of autoBlocks) b.segTotal = totalByGroup[b.occurrenceKey || b.taskId];
 
-  return { autoBlocks, expandedBlocked, overdue: [...overdue], unscheduled: [...unscheduled] };
+  return { autoBlocks, expandedBlocked, overdue: [...overdue], unscheduled: [...unscheduled], blockedByDependency: [...blockedByDependency] };
 }
 
 /* ============================= default seed data ========================= */
@@ -345,11 +476,11 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
 function seedTasks() {
   const today = startOfDay(new Date());
   return [
-    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", repeatDueRule: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", repeatDueRule: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", repeatDueRule: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", repeatDueRule: 4, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", repeatDueRule: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", repeatDueRule: 4, dependsOn: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
   ];
 }
 function seedWorkRanges() {
@@ -394,7 +525,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-15";
+const BUILD_TAG = "2026.08.18-17";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -517,6 +648,7 @@ export default function App() {
   const [privateRanges, setPrivateRanges] = useState({});
   const [completionLog, setCompletionLog] = useState([]); // history of completions, for the weekly review
   const [completedOccurrences, setCompletedOccurrences] = useState([]); // which specific periods of repeating tasks are done, e.g. "taskId::d:2026-08-17"
+  const [recentColors, setRecentColors] = useState([]); // hex strings, most-recently-used first, for the task color picker
 
   const [weekStartOffset, setWeekStartOffset] = useState(0); // in days
   const [taskModal, setTaskModal] = useState(null); // null | 'new' | task object
@@ -563,7 +695,7 @@ export default function App() {
   /* ---- load once ---- */
   useEffect(() => {
     (async () => {
-      const [t, be, lb, wr, pr, cl, co, hle, lua] = await Promise.all([
+      const [t, be, lb, wr, pr, cl, co, hle, lua, rc] = await Promise.all([
         loadKey("tasks", null),
         loadKey("blockedEvents", null),
         loadKey("lockedBlocks", null),
@@ -573,6 +705,7 @@ export default function App() {
         loadKey("completedOccurrences", null),
         loadKey("hasLocalEdits", false),
         loadKey("localUpdatedAt", null),
+        loadKey("recentColors", null),
       ]);
       setTasks(t || seedTasks());
       setBlockedEvents(be || seedBlockedEvents());
@@ -583,6 +716,7 @@ export default function App() {
       setCompletedOccurrences(co || []);
       setHasLocalEdits(hle);
       setLocalUpdatedAt(lua);
+      setRecentColors(rc || []);
       setReady(true);
     })();
   }, []);
@@ -597,6 +731,14 @@ export default function App() {
   useEffect(() => { if (ready) saveKey("completedOccurrences", completedOccurrences); }, [completedOccurrences, ready]);
   useEffect(() => { if (ready) saveKey("hasLocalEdits", hasLocalEdits); }, [hasLocalEdits, ready]);
   useEffect(() => { if (ready) saveKey("localUpdatedAt", localUpdatedAt); }, [localUpdatedAt, ready]);
+  useEffect(() => { if (ready) saveKey("recentColors", recentColors); }, [recentColors, ready]);
+
+  // adds a hex color to the front of the "recently used" list for the task
+  // color picker, de-duping and capping so it stays a short, useful list
+  function addRecentColor(hex) {
+    if (!hex) return;
+    setRecentColors(prev => [hex, ...prev.filter(c => c.toLowerCase() !== hex.toLowerCase())].slice(0, 8));
+  }
 
   // marks this device as having "real" data worth protecting during sync,
   // and records exactly when it actually changed — but skips the very first
@@ -633,7 +775,7 @@ export default function App() {
      past a 15-min boundary — see `now` below — so today's already-passed
      hours never get reclaimed as free by the auto-scheduler) ---- */
   const schedule = useMemo(() => {
-    if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [] };
+    if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [], blockedByDependency: [] };
     return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now });
   }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now, ready]);
 
@@ -642,7 +784,7 @@ export default function App() {
   const allBlocks = useMemo(() => {
     const locked = lockedBlocks.map(b => {
       const t = tasksById[b.taskId];
-      return { id: b.id, taskId: b.taskId, occurrenceKey: b.occurrenceKey || null, name: t ? t.name : "(deleted task)", category: t ? t.category : "work", start: new Date(b.start), end: new Date(b.end), locked: true, segIndex: 1, segTotal: 1 };
+      return { id: b.id, taskId: b.taskId, occurrenceKey: b.occurrenceKey || null, name: t ? t.name : "(deleted task)", category: t ? t.category : "work", color: t ? t.color : null, start: new Date(b.start), end: new Date(b.end), locked: true, segIndex: 1, segTotal: 1 };
     });
     return [...locked, ...schedule.autoBlocks];
   }, [lockedBlocks, schedule.autoBlocks, tasksById]);
@@ -656,7 +798,7 @@ export default function App() {
     setTasks(prev => prev.map(t => (t.id === id ? { ...t, ...patch } : t)));
   }
   function deleteTask(id) {
-    setTasks(prev => prev.filter(t => t.id !== id));
+    setTasks(prev => prev.filter(t => t.id !== id).map(t => (t.dependsOn === id ? { ...t, dependsOn: null } : t)));
     setLockedBlocks(prev => prev.filter(b => b.taskId !== id));
     showToast("Task deleted");
   }
@@ -991,6 +1133,7 @@ export default function App() {
     tasks: filteredTasks,
     overdueIds: schedule.overdue,
     unscheduledIds: schedule.unscheduled,
+    tasksById,
     categoryFilter, setCategoryFilter,
     search, setSearch,
     showCompleted, setShowCompleted,
@@ -1058,8 +1201,11 @@ export default function App() {
       {taskModal && (
         <TaskModal
           initial={taskModal === "new" ? null : taskModal}
+          recentColors={recentColors}
+          allTasks={tasks}
           onClose={() => setTaskModal(null)}
           onSave={(data) => {
+            if (data.color) addRecentColor(data.color);
             if (taskModal !== "new" && taskModal.id) updateTask(taskModal.id, data);
             else addTask(data);
             setTaskModal(null);
@@ -1168,10 +1314,13 @@ function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTa
 /* ================================ sidebar =================================== */
 
 function Sidebar({
-  tasks, overdueIds, unscheduledIds, categoryFilter, setCategoryFilter, search, setSearch,
+  tasks, overdueIds, unscheduledIds, tasksById, categoryFilter, setCategoryFilter, search, setSearch,
   showCompleted, setShowCompleted, onAddTask, onEditTask, onDeleteTask, onToggleComplete,
   blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked, completedOccurrences, now,
 }) {
+  const oneOffTasks = tasks.filter(t => !t.repeat || t.repeat === "none");
+  const repeatingTasks = tasks.filter(t => t.repeat && t.repeat !== "none");
+
   return (
     <div className="sidebar">
       <div className="sidebar-search">
@@ -1196,11 +1345,33 @@ function Sidebar({
           <button className="icon-btn small" onClick={onAddTask}><Plus size={13} /></button>
         </div>
 
-        {tasks.length === 0 && <div className="empty-hint">Nothing here. Add a task to start blocking your week.</div>}
+        {oneOffTasks.length === 0 && <div className="empty-hint">Nothing here. Add a task to start blocking your week.</div>}
 
-        {tasks.map(t => (
+        {oneOffTasks.map(t => (
           <TaskRow
             key={t.id} task={t}
+            dependsOnTask={t.dependsOn ? tasksById[t.dependsOn] : null}
+            isOverdue={overdueIds.includes(t.id)}
+            isUnscheduled={unscheduledIds.includes(t.id)}
+            completedOccurrences={completedOccurrences}
+            now={now}
+            onEdit={() => onEditTask(t)}
+            onDelete={() => onDeleteTask(t.id)}
+            onToggle={() => onToggleComplete(t, currentPeriodKeyFor(t, now))}
+          />
+        ))}
+
+        <div className="section-title" style={{ marginTop: 18 }}>
+          <span><Repeat size={12} /> Repeating</span>
+          <button className="icon-btn small" onClick={onAddTask}><Plus size={13} /></button>
+        </div>
+
+        {repeatingTasks.length === 0 && <div className="empty-hint">No repeating tasks yet.</div>}
+
+        {repeatingTasks.map(t => (
+          <TaskRow
+            key={t.id} task={t}
+            dependsOnTask={t.dependsOn ? tasksById[t.dependsOn] : null}
             isOverdue={overdueIds.includes(t.id)}
             isUnscheduled={unscheduledIds.includes(t.id)}
             completedOccurrences={completedOccurrences}
@@ -1233,7 +1404,7 @@ function Sidebar({
   );
 }
 
-function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, completedOccurrences, now }) {
+function TaskRow({ task, dependsOnTask, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, completedOccurrences, now }) {
   const cat = CATEGORY_META[task.category];
   const pri = PRIORITY_META[task.priority];
   const Icon = cat.icon;
@@ -1256,8 +1427,14 @@ function TaskRow({ task, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, c
           {!isRepeating && task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
           {isOverdue && <span className="meta-chip meta-warn"><AlertTriangle size={11} /> At risk</span>}
           {isUnscheduled && <span className="meta-chip meta-danger"><AlertTriangle size={11} /> Won't fit</span>}
+          {dependsOnTask && (
+            <span className="meta-chip meta-dep" title={`Won't be scheduled before "${dependsOnTask.name}"`}>
+              <Link2 size={11} /> After {dependsOnTask.name}
+            </span>
+          )}
         </div>
       </div>
+      {task.color && <span className="color-dot" style={{ background: task.color }} title="Custom color" />}
       <span className="pri-dot" style={{ background: pri.color }} title={pri.label} />
       <button className="icon-btn small ghost" onClick={onDelete}><Trash2 size={12} /></button>
     </div>
@@ -1293,7 +1470,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
     const durationMin = (draggingBlock.current.end - draggingBlock.current.start) / MIN_MS;
     let startMin = Math.round(y / PX_PER_MIN / 15) * 15;
     startMin = Math.max(0, Math.min(gridMinutes - durationMin, startMin));
-    setDragGhost({ dayIdx, top: startMin * PX_PER_MIN, height: durationMin * PX_PER_MIN, category: draggingBlock.current.category });
+    setDragGhost({ dayIdx, top: startMin * PX_PER_MIN, height: durationMin * PX_PER_MIN, category: draggingBlock.current.category, color: draggingBlock.current.color });
   }
 
   function handleDrop(e, day, dayIdx) {
@@ -1382,7 +1559,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
                   // real time slot, which is what used to cause short back-to-back
                   // tasks to visually overlap the next block.
                   const compact = rawHeight < 34;
-                  const cat = CATEGORY_META[b.category];
+                  const blockColor = colorFor(b.category, b.color);
                   const risky = overdueIds.includes(b.taskId);
                   return (
                     <div
@@ -1392,7 +1569,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
                       title={`${b.name} · ${fmt12(b.start)}–${fmt12(b.end)}`}
                       onDragStart={(e) => handleDragStart(e, b)}
                       onDragEnd={() => setDragGhost(null)}
-                      style={{ top, height, "--accent": cat.accent, "--tint": cat.tint }}
+                      style={{ top, height, "--accent": blockColor.accent, "--tint": blockColor.tint }}
                       onClick={() => onEditTask(b.taskId)}
                     >
                       <div className="task-block-head">
@@ -1417,7 +1594,7 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
                 })}
 
                 {dragGhost && dragGhost.dayIdx === dayIdx && (
-                  <div className="drag-ghost" style={{ top: dragGhost.top, height: dragGhost.height, borderColor: CATEGORY_META[dragGhost.category].accent }} />
+                  <div className="drag-ghost" style={{ top: dragGhost.top, height: dragGhost.height, borderColor: colorFor(dragGhost.category, dragGhost.color).accent }} />
                 )}
               </div>
             );
@@ -1430,15 +1607,161 @@ function CalendarGrid({ weekDays, blocks, blockedRanges, overdueIds, onDropBlock
 
 /* =============================== task modal ================================= */
 
-function TaskModal({ initial, onClose, onSave }) {
+/* a draggable hue/saturation wheel (angle = hue, radius = saturation) —
+   lightness is handled separately by a slider underneath, since a single
+   wheel can only encode two of the three HSL dimensions */
+function ColorWheel({ hue, sat, onPick, size = 140 }) {
+  const canvasRef = useRef(null);
+  const draggingRef = useRef(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const w = size, h = size, cx = w / 2, cy = h / 2, radius = w / 2;
+    const img = ctx.createImageData(w, h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const dx = x - cx + 0.5, dy = y - cy + 0.5;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const idx = (y * w + x) * 4;
+        if (dist <= radius) {
+          let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+          angle = (angle + 360) % 360;
+          const s = Math.min(1, dist / radius);
+          const { r, g, b } = hexToRgb(hslToHex(angle, s * 100, 50));
+          img.data[idx] = r; img.data[idx + 1] = g; img.data[idx + 2] = b; img.data[idx + 3] = 255;
+        } else {
+          img.data[idx + 3] = 0;
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [size]);
+
+  function pickFromEvent(e) {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const cx = size / 2, cy = size / 2, radius = size / 2;
+    const dx = x - cx, dy = y - cy;
+    const dist = Math.min(radius, Math.sqrt(dx * dx + dy * dy));
+    let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+    angle = (angle + 360) % 360;
+    onPick(angle, (dist / radius) * 100);
+  }
+
+  function handlePointerDown(e) {
+    e.preventDefault();
+    draggingRef.current = true;
+    canvasRef.current?.setPointerCapture?.(e.pointerId);
+    pickFromEvent(e);
+  }
+  function handlePointerMove(e) { if (draggingRef.current) pickFromEvent(e); }
+  function handlePointerUp() { draggingRef.current = false; }
+
+  const angleRad = (hue * Math.PI) / 180;
+  const radius = (sat / 100) * (size / 2);
+  const markerX = size / 2 + radius * Math.cos(angleRad);
+  const markerY = size / 2 + radius * Math.sin(angleRad);
+
+  return (
+    <div className="color-wheel-wrap" style={{ width: size, height: size }}>
+      <canvas
+        ref={canvasRef} width={size} height={size} className="color-wheel-canvas"
+        onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp}
+      />
+      <div className="color-wheel-marker" style={{ left: markerX, top: markerY }} />
+    </div>
+  );
+}
+
+/* the "dropdown that opens into a color wheel" field: a button showing the
+   current swatch, which expands into recently-used swatches + the wheel +
+   a lightness slider. Leaving color unset (null) keeps the task on the
+   category default (blue for work, purple for private). */
+function ColorPickerField({ color, onChange, recentColors, defaultAccent }) {
+  const [open, setOpen] = useState(false);
+  const startHsl = color ? hexToHsl(color) : { h: 224, s: 70, l: 65 };
+  const [hue, setHue] = useState(startHsl.h);
+  const [sat, setSat] = useState(startHsl.s);
+  const [light, setLight] = useState(startHsl.l);
+
+  function applyHsl(h, s, l) {
+    setHue(h); setSat(s); setLight(l);
+    onChange(hslToHex(h, s, l));
+  }
+  function applyHex(hex) {
+    const hsl = hexToHsl(hex);
+    setHue(hsl.h); setSat(hsl.s); setLight(hsl.l);
+    onChange(hex);
+  }
+
+  return (
+    <div className="color-field">
+      <button type="button" className="color-dropdown-btn" onClick={() => setOpen(o => !o)}>
+        <span className="color-swatch-sm" style={{ background: color || defaultAccent }} />
+        <span>{color ? "Custom color" : "Default color"}</span>
+        <ChevronDown size={14} style={{ transform: open ? "rotate(180deg)" : "none", transition: "transform .15s", marginLeft: "auto" }} />
+      </button>
+      {open && (
+        <div className="color-popover">
+          {recentColors && recentColors.length > 0 && (
+            <>
+              <div className="color-popover-label">Recent</div>
+              <div className="color-recent-row">
+                {recentColors.map(c => (
+                  <button key={c} type="button" className="color-swatch" style={{ background: c }} onClick={() => applyHex(c)} title={c} />
+                ))}
+              </div>
+            </>
+          )}
+          <div className="color-popover-label">Pick a color</div>
+          <ColorWheel hue={hue} sat={sat} onPick={(h, s) => applyHsl(h, s, light)} />
+          <input
+            type="range" min={0} max={100} value={Math.round(light)}
+            onChange={e => applyHsl(hue, sat, Number(e.target.value))}
+            className="lightness-slider"
+            style={{ background: `linear-gradient(to right, #000, ${hslToHex(hue, sat, 50)}, #fff)` }}
+          />
+          {color && <button type="button" className="color-reset-btn" onClick={() => onChange(null)}>Reset to default</button>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* every task that (directly or transitively) depends on `taskId` — used to
+   keep the "Depends on" dropdown from offering a choice that would create a
+   dependency cycle */
+function dependentDescendants(taskId, allTasks) {
+  const children = allTasks.filter(t => t.dependsOn === taskId).map(t => t.id);
+  const all = new Set(children);
+  for (const c of children) {
+    for (const d of dependentDescendants(c, allTasks)) all.add(d);
+  }
+  return all;
+}
+
+function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
   const today = new Date();
   const [name, setName] = useState(initial?.name || "");
   const [category, setCategory] = useState(initial?.category || "work");
   const [priority, setPriority] = useState(initial?.priority || "medium");
   const [duration, setDuration] = useState(initial?.duration || 60);
+  const [color, setColor] = useState(initial?.color || null);
+  const [dependsOn, setDependsOn] = useState(initial?.dependsOn || "");
   const [hasDue, setHasDue] = useState(!!initial?.dueDate);
   const [dueDate, setDueDate] = useState(initial?.dueDate ? new Date(initial.dueDate).toISOString().slice(0, 10) : "");
   const [repeat, setRepeat] = useState(initial?.repeat || "none");
+
+  // tasks this one could validly depend on — excludes itself and anything
+  // that already (directly or transitively) depends on it, which would
+  // otherwise create a dependency cycle
+  const excluded = initial?.id ? dependentDescendants(initial.id, allTasks || []) : new Set();
+  const dependencyOptions = (allTasks || []).filter(t => t.id !== initial?.id && !excluded.has(t.id));
+  const dependsOnTask = dependencyOptions.find(t => t.id === dependsOn) || null;
 
   // repeat-segment due day — only meaningful for weekly/monthly repeats.
   const [hasRepeatDue, setHasRepeatDue] = useState(initial?.repeatDueRule != null);
@@ -1458,9 +1781,9 @@ function TaskModal({ initial, onClose, onSave }) {
     if (repeat === "weekly" && hasRepeatDue) repeatDueRule = repeatDueWeekday;
     if (repeat === "monthly" && hasRepeatDue) repeatDueRule = repeatDueLastDay ? -1 : (Number(repeatDueDay) || 1);
     onSave({
-      name: name.trim(), category, priority, duration: Number(duration) || 15,
+      name: name.trim(), category, priority, duration: Number(duration) || 15, color,
       dueDate: hasDue && dueDate ? new Date(dueDate + "T23:59:00").toISOString() : null,
-      repeat, repeatDueRule,
+      repeat, repeatDueRule, dependsOn: dependsOn || null,
     });
   }
 
@@ -1492,6 +1815,25 @@ function TaskModal({ initial, onClose, onSave }) {
         <input className="text-input small" type="number" min={15} step={15} value={duration} onChange={e => setDuration(e.target.value)} />
         <span className="unit-label">minutes</span>
       </div>
+
+      <label className="field-label">Color</label>
+      <ColorPickerField
+        color={color} onChange={setColor}
+        recentColors={recentColors || []}
+        defaultAccent={CATEGORY_META[category].accent}
+      />
+      <div className="hint-text">Sets this task's color on the calendar. Leave unset to use the {category} category's default color.</div>
+
+      <label className="field-label">Depends on</label>
+      <select className="text-input" value={dependsOn} onChange={e => setDependsOn(e.target.value)}>
+        <option value="">None</option>
+        {dependencyOptions.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+      </select>
+      {dependsOnTask && (
+        <div className="hint-text">
+          Won't be scheduled until "{dependsOnTask.name}" {dependsOnTask.repeat && dependsOnTask.repeat !== "none" ? "has run earlier that same day" : "is scheduled earlier"}, or is marked complete.
+        </div>
+      )}
 
       <label className="field-label">Repeats</label>
       <select className="text-input" value={repeat} onChange={e => setRepeat(e.target.value)}>
@@ -2002,7 +2344,9 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 }
 .meta-warn{color:#FFB86B; border-color:#4a3a20;}
 .meta-danger{color:var(--danger); border-color:#4a2228;}
+.meta-dep{color:#8FA3FF; border-color:#2c3260;}
 .pri-dot{width:6px; height:6px; border-radius:50%; margin-top:6px; flex-shrink:0;}
+.color-dot{width:9px; height:9px; border-radius:50%; margin-top:5px; flex-shrink:0; border:1px solid rgba(255,255,255,0.35);}
 .icon-btn{
   background:transparent; border:none; color:var(--text-dim); cursor:pointer; padding:6px; border-radius:8px;
   display:flex; align-items:center; justify-content:center; transition:all .15s;
@@ -2158,6 +2502,42 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 }
 .segment-active{color:var(--text); border-color:var(--c); background:color-mix(in srgb, var(--c) 16%, transparent);}
 .modal-actions{display:flex; justify-content:flex-end; gap:8px; margin-top:20px;}
+
+.color-field{position:relative;}
+.color-dropdown-btn{
+  width:100%; display:flex; align-items:center; gap:8px; background:var(--surface); border:1px solid var(--border);
+  color:var(--text); font-size:13px; padding:8px 11px; border-radius:9px; cursor:pointer;
+}
+.color-dropdown-btn:hover{border-color:#3a4256;}
+.color-swatch-sm{width:16px; height:16px; border-radius:50%; flex-shrink:0; border:1px solid rgba(255,255,255,0.25);}
+.color-popover{
+  margin-top:8px; padding:12px; background:var(--bg-elevated); border:1px solid var(--border); border-radius:12px;
+  display:flex; flex-direction:column; align-items:center; gap:4px;
+}
+.color-popover-label{align-self:flex-start; font-size:10.5px; color:var(--text-faint); text-transform:uppercase; letter-spacing:0.04em; margin:4px 0;}
+.color-recent-row{display:flex; gap:7px; flex-wrap:wrap; align-self:flex-start;}
+.color-swatch{
+  width:22px; height:22px; border-radius:50%; border:1px solid rgba(255,255,255,0.25); cursor:pointer; padding:0; flex-shrink:0;
+}
+.color-swatch:hover{transform:scale(1.1);}
+.color-wheel-wrap{position:relative; margin:4px 0;}
+.color-wheel-canvas{border-radius:50%; cursor:crosshair; touch-action:none; display:block;}
+.color-wheel-marker{
+  position:absolute; width:12px; height:12px; margin-left:-6px; margin-top:-6px; border-radius:50%;
+  border:2px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.4); pointer-events:none;
+}
+.lightness-slider{
+  width:100%; margin-top:10px; -webkit-appearance:none; appearance:none; height:10px; border-radius:5px; outline:none; cursor:pointer;
+}
+.lightness-slider::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none; width:16px; height:16px; border-radius:50%; background:#fff;
+  border:2px solid #222; cursor:pointer;
+}
+.lightness-slider::-moz-range-thumb{width:16px; height:16px; border-radius:50%; background:#fff; border:2px solid #222; cursor:pointer;}
+.color-reset-btn{
+  margin-top:10px; background:none; border:none; color:var(--text-dim); font-size:12px; cursor:pointer; text-decoration:underline;
+}
+.color-reset-btn:hover{color:var(--text);}
 
 .hours-grid{display:grid; grid-template-columns:1fr 1fr; gap:22px;}
 .hours-col-title{display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; margin-bottom:10px;}
