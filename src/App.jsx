@@ -525,7 +525,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-17";
+const BUILD_TAG = "2026.08.18-18";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -771,13 +771,17 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), 3200);
   }
 
-  /* ---- scheduling (recomputed whenever inputs change, or the clock ticks
-     past a 15-min boundary — see `now` below — so today's already-passed
-     hours never get reclaimed as free by the auto-scheduler) ---- */
+  /* ---- scheduling (recomputed only when real inputs change — tasks,
+     blocks, hours, etc. — NOT on every clock tick. Reflowing on a timer
+     alone would reshuffle blocks while you're mid-task, which is
+     disruptive; instead we grab a fresh timestamp each time a real change
+     triggers a recompute, which is still enough to keep the auto-scheduler
+     from backfilling into hours that have since passed) ---- */
   const schedule = useMemo(() => {
     if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [], blockedByDependency: [] };
-    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now });
-  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now, ready]);
+    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now: new Date() });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, ready]);
 
   const tasksById = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
 
