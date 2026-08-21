@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   Plus, X, Check, Trash2, Settings, ChevronLeft, ChevronRight, ChevronDown, Repeat,
-  Briefcase, Home, AlertTriangle, Ban, Search, RotateCcw, Clock, Flame, Link2,
+  Briefcase, Home, AlertTriangle, Ban, Search, RotateCcw, Clock, Flame, Link2, Percent,
   CalendarDays, GripVertical, Undo2, BarChart3, CheckCircle2, Cloud, CloudOff
 } from "lucide-react";
 
@@ -106,6 +106,35 @@ function formatDuration(mins) {
   if (h === 0) return `${m}m`;
   if (m === 0) return `${h}h`;
   return `${h}h ${m}m`;
+}
+/**
+ * Splits a total duration into N sub-task durations, for the "split into
+ * parts" task-creation feature:
+ *   - mode "count": exactly `arg` parts, as evenly sized as possible — any
+ *     leftover minutes (from rounding) get tacked onto the last part so the
+ *     parts still add up exactly to the original total.
+ *   - mode "length": as many `arg`-minute parts as it takes, with the last
+ *     part taking whatever remainder is left (which may be shorter than
+ *     `arg`, or exactly `arg` if it divides evenly).
+ * Returns a single-element array (no real split) if the settings wouldn't
+ * actually produce more than one part.
+ */
+function computeSplitDurations(totalMinutes, mode, arg) {
+  const total = Math.max(1, Math.round(totalMinutes));
+  if (mode === "count") {
+    const n = Math.max(1, Math.floor(arg) || 1);
+    if (n <= 1) return [total];
+    const base = Math.floor(total / n);
+    const parts = new Array(n).fill(base);
+    parts[n - 1] += total - base * n; // remainder goes to the last part
+    return parts;
+  }
+  const segLen = Math.max(1, Math.floor(arg) || 1);
+  const n = Math.max(1, Math.ceil(total / segLen));
+  if (n <= 1) return [total];
+  const parts = new Array(n).fill(segLen);
+  parts[n - 1] = total - segLen * (n - 1); // remainder (or a full segment, if it divides evenly)
+  return parts;
 }
 function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 function ordinal(n) {
@@ -279,7 +308,7 @@ function dependencyDepth(taskId, tasksById, memo, visiting) {
   return depth;
 }
 
-function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges, now = new Date() }) {
+function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, horizonDays = HORIZON_DAYS, minChunk = MIN_CHUNK, workRanges, privateRanges, occurrenceProgress = {}, now = new Date() }) {
   const today = startOfDay(now);
   const doneSet = new Set(completedOccurrences || []);
   const tasksById = Object.fromEntries(tasks.map(t => [t.id, t]));
@@ -349,7 +378,10 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
       if (t.completed) continue;
       const lockedForOcc = lockedBlocks.filter(b => b.taskId === t.id && !b.occurrenceKey);
       const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
-      const remaining = Math.max(0, t.duration - lockedMinutes);
+      // a partial-completion percentage shrinks how much time is left to
+      // find room for, without marking the task fully done
+      const effectiveDuration = t.duration * (1 - (t.progressPercent || 0) / 100);
+      const remaining = Math.max(0, Math.round(effectiveDuration) - lockedMinutes);
       if (remaining <= 0) continue;
       instances.push({
         taskId: t.id, occurrenceKey: null, name: t.name, category: t.category, priority: t.priority,
@@ -364,7 +396,8 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
         }
         const lockedForOcc = lockedBlocks.filter(b => b.occurrenceKey === occurrenceKey);
         const lockedMinutes = lockedForOcc.reduce((s, b) => s + (new Date(b.end) - new Date(b.start)) / MIN_MS, 0);
-        const remaining = Math.max(0, t.duration - lockedMinutes);
+        const effectiveDuration = t.duration * (1 - (occurrenceProgress[occurrenceKey] || 0) / 100);
+        const remaining = Math.max(0, Math.round(effectiveDuration) - lockedMinutes);
         if (remaining <= 0) continue;
         instances.push({
           taskId: t.id, occurrenceKey, name: t.name, category: t.category, priority: t.priority,
@@ -476,11 +509,11 @@ function computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurren
 function seedTasks() {
   const today = startOfDay(new Date());
   return [
-    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", repeatDueRule: 4, dependsOn: null, completed: false, lastCompletedAt: null },
-    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", repeatDueRule: null, dependsOn: null, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Review MPRA figure drafts", category: "work", priority: "high", duration: 120, dueDate: addDays(today, 2).toISOString(), repeat: "none", repeatDueRule: null, dependsOn: null, progressPercent: 0, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Reply to lab emails", category: "work", priority: "medium", duration: 30, dueDate: null, repeat: "daily", repeatDueRule: null, dependsOn: null, progressPercent: 0, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Grocery run", category: "private", priority: "medium", duration: 60, dueDate: null, repeat: "weekly", repeatDueRule: null, dependsOn: null, progressPercent: 0, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Gym session", category: "private", priority: "low", duration: 75, dueDate: null, repeat: "weekly", repeatDueRule: 4, dependsOn: null, progressPercent: 0, completed: false, lastCompletedAt: null },
+    { id: uid(), name: "Prep NIW recommender notes", category: "work", priority: "urgent", duration: 180, dueDate: addDays(today, 4).toISOString(), repeat: "none", repeatDueRule: null, dependsOn: null, progressPercent: 0, completed: false, lastCompletedAt: null },
   ];
 }
 function seedWorkRanges() {
@@ -525,7 +558,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-18";
+const BUILD_TAG = "2026.08.18-19";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -649,6 +682,7 @@ export default function App() {
   const [completionLog, setCompletionLog] = useState([]); // history of completions, for the weekly review
   const [completedOccurrences, setCompletedOccurrences] = useState([]); // which specific periods of repeating tasks are done, e.g. "taskId::d:2026-08-17"
   const [recentColors, setRecentColors] = useState([]); // hex strings, most-recently-used first, for the task color picker
+  const [occurrenceProgress, setOccurrenceProgress] = useState({}); // occurrenceKey -> percent complete (0-100), for repeating tasks' partial-completion slider
 
   const [weekStartOffset, setWeekStartOffset] = useState(0); // in days
   const [taskModal, setTaskModal] = useState(null); // null | 'new' | task object
@@ -695,7 +729,7 @@ export default function App() {
   /* ---- load once ---- */
   useEffect(() => {
     (async () => {
-      const [t, be, lb, wr, pr, cl, co, hle, lua, rc] = await Promise.all([
+      const [t, be, lb, wr, pr, cl, co, hle, lua, rc, op] = await Promise.all([
         loadKey("tasks", null),
         loadKey("blockedEvents", null),
         loadKey("lockedBlocks", null),
@@ -706,6 +740,7 @@ export default function App() {
         loadKey("hasLocalEdits", false),
         loadKey("localUpdatedAt", null),
         loadKey("recentColors", null),
+        loadKey("occurrenceProgress", null),
       ]);
       setTasks(t || seedTasks());
       setBlockedEvents(be || seedBlockedEvents());
@@ -717,6 +752,7 @@ export default function App() {
       setHasLocalEdits(hle);
       setLocalUpdatedAt(lua);
       setRecentColors(rc || []);
+      setOccurrenceProgress(op || {});
       setReady(true);
     })();
   }, []);
@@ -732,6 +768,7 @@ export default function App() {
   useEffect(() => { if (ready) saveKey("hasLocalEdits", hasLocalEdits); }, [hasLocalEdits, ready]);
   useEffect(() => { if (ready) saveKey("localUpdatedAt", localUpdatedAt); }, [localUpdatedAt, ready]);
   useEffect(() => { if (ready) saveKey("recentColors", recentColors); }, [recentColors, ready]);
+  useEffect(() => { if (ready) saveKey("occurrenceProgress", occurrenceProgress); }, [occurrenceProgress, ready]);
 
   // adds a hex color to the front of the "recently used" list for the task
   // color picker, de-duping and capping so it stays a short, useful list
@@ -779,9 +816,9 @@ export default function App() {
      from backfilling into hours that have since passed) ---- */
   const schedule = useMemo(() => {
     if (!ready) return { autoBlocks: [], expandedBlocked: [], overdue: [], unscheduled: [], blockedByDependency: [] };
-    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, now: new Date() });
+    return computeSchedule({ tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, occurrenceProgress, now: new Date() });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, ready]);
+  }, [tasks, blockedEvents, lockedBlocks, completedOccurrences, workRanges, privateRanges, occurrenceProgress, ready]);
 
   const tasksById = useMemo(() => Object.fromEntries(tasks.map(t => [t.id, t])), [tasks]);
 
@@ -795,11 +832,43 @@ export default function App() {
 
   /* ---- task CRUD ---- */
   function addTask(data) {
-    setTasks(prev => [...prev, { id: uid(), completed: false, lastCompletedAt: null, ...data }]);
+    setTasks(prev => [...prev, { id: uid(), completed: false, lastCompletedAt: null, progressPercent: 0, ...data }]);
     showToast(`Added "${data.name}"`);
+  }
+  function addSplitTask({ baseName, category, priority, color, dueDate, repeat, repeatDueRule, parts }) {
+    if (color) addRecentColor(color);
+    let prevId = null;
+    const newTasks = parts.map((partDuration, idx) => {
+      const id = uid();
+      const t = {
+        id, name: `${baseName} (Part ${idx + 1})`, category, priority, duration: partDuration,
+        dueDate: dueDate || null, repeat, repeatDueRule, color: color || null,
+        dependsOn: prevId, completed: false, lastCompletedAt: null, progressPercent: 0,
+      };
+      prevId = id;
+      return t;
+    });
+    setTasks(prev => [...prev, ...newTasks]);
+    showToast(`Split "${baseName}" into ${parts.length} parts`);
   }
   function updateTask(id, patch) {
     setTasks(prev => prev.map(t => (t.id === id ? { ...t, ...patch } : t)));
+  }
+  // partial-completion slider — reduces the remaining time the scheduler
+  // needs to find room for, without marking the task/occurrence fully done.
+  // Reaching 100% hands off to the normal completion flow instead (so it
+  // still gets logged and prompts for actual time spent, same as the checkbox).
+  function setTaskProgress(task, occurrenceKey, percent) {
+    const pct = Math.max(0, Math.min(100, Math.round(percent)));
+    if (pct >= 100) {
+      toggleComplete(task, occurrenceKey);
+      return;
+    }
+    if (occurrenceKey) {
+      setOccurrenceProgress(prev => ({ ...prev, [occurrenceKey]: pct }));
+    } else {
+      setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, progressPercent: pct } : t)));
+    }
   }
   function deleteTask(id) {
     setTasks(prev => prev.filter(t => t.id !== id).map(t => (t.dependsOn === id ? { ...t, dependsOn: null } : t)));
@@ -833,10 +902,16 @@ export default function App() {
     if (task.repeat && task.repeat !== "none") {
       setLockedBlocks(prev => prev.filter(b => b.occurrenceKey !== occurrenceKey)); // free up any locked slot for just this occurrence
       setCompletedOccurrences(prev => [...prev, occurrenceKey]);
+      setOccurrenceProgress(prev => {
+        if (!(occurrenceKey in prev)) return prev;
+        const next = { ...prev };
+        delete next[occurrenceKey];
+        return next;
+      });
       showToast(`Nice work! "${task.name}" is done for this period — it'll come back next time around`);
     } else {
       setLockedBlocks(prev => prev.filter(b => b.taskId !== task.id));
-      setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, completed: true, lastCompletedAt: new Date().toISOString() } : t)));
+      setTasks(prev => prev.map(t => (t.id === task.id ? { ...t, completed: true, lastCompletedAt: new Date().toISOString(), progressPercent: 0 } : t)));
       showToast(`Marked "${task.name}" complete — rescheduling the rest of your week`);
     }
     setCompletingTask(null);
@@ -1145,6 +1220,8 @@ export default function App() {
     onEditTask: (t) => { setTaskModal(t); setMobileTasksOpen(false); },
     onDeleteTask: deleteTask,
     onToggleComplete: toggleComplete,
+    onSetProgress: setTaskProgress,
+    occurrenceProgress,
     completedOccurrences,
     now,
     blockedEvents,
@@ -1209,9 +1286,13 @@ export default function App() {
           allTasks={tasks}
           onClose={() => setTaskModal(null)}
           onSave={(data) => {
-            if (data.color) addRecentColor(data.color);
-            if (taskModal !== "new" && taskModal.id) updateTask(taskModal.id, data);
-            else addTask(data);
+            if (data.__split) {
+              addSplitTask(data);
+            } else {
+              if (data.color) addRecentColor(data.color);
+              if (taskModal !== "new" && taskModal.id) updateTask(taskModal.id, data);
+              else addTask(data);
+            }
             setTaskModal(null);
           }}
         />
@@ -1320,10 +1401,40 @@ function Header({ weekDays, onPrev, onNext, onToday, stats, onOpenHours, onAddTa
 function Sidebar({
   tasks, overdueIds, unscheduledIds, tasksById, categoryFilter, setCategoryFilter, search, setSearch,
   showCompleted, setShowCompleted, onAddTask, onEditTask, onDeleteTask, onToggleComplete,
-  blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked, completedOccurrences, now,
+  onSetProgress, occurrenceProgress, blockedEvents, onAddBlocked, onEditBlocked, onDeleteBlocked, completedOccurrences, now,
 }) {
   const oneOffTasks = tasks.filter(t => !t.repeat || t.repeat === "none");
   const repeatingTasks = tasks.filter(t => t.repeat && t.repeat !== "none");
+  const [expandedId, setExpandedId] = useState(null);
+
+  function progressForTask(t) {
+    if (t.repeat && t.repeat !== "none") {
+      const key = currentPeriodKeyFor(t, now);
+      return key ? (occurrenceProgress[key] || 0) : 0;
+    }
+    return t.progressPercent || 0;
+  }
+
+  function renderRow(t) {
+    const occKey = t.repeat && t.repeat !== "none" ? currentPeriodKeyFor(t, now) : null;
+    return (
+      <TaskRow
+        key={t.id} task={t}
+        dependsOnTask={t.dependsOn ? tasksById[t.dependsOn] : null}
+        isOverdue={overdueIds.includes(t.id)}
+        isUnscheduled={unscheduledIds.includes(t.id)}
+        completedOccurrences={completedOccurrences}
+        now={now}
+        progressPercent={progressForTask(t)}
+        expanded={expandedId === t.id}
+        onToggleExpand={() => setExpandedId(prev => (prev === t.id ? null : t.id))}
+        onSetProgress={(pct) => onSetProgress(t, occKey, pct)}
+        onEdit={() => onEditTask(t)}
+        onDelete={() => onDeleteTask(t.id)}
+        onToggle={() => onToggleComplete(t, currentPeriodKeyFor(t, now))}
+      />
+    );
+  }
 
   return (
     <div className="sidebar">
@@ -1351,19 +1462,7 @@ function Sidebar({
 
         {oneOffTasks.length === 0 && <div className="empty-hint">Nothing here. Add a task to start blocking your week.</div>}
 
-        {oneOffTasks.map(t => (
-          <TaskRow
-            key={t.id} task={t}
-            dependsOnTask={t.dependsOn ? tasksById[t.dependsOn] : null}
-            isOverdue={overdueIds.includes(t.id)}
-            isUnscheduled={unscheduledIds.includes(t.id)}
-            completedOccurrences={completedOccurrences}
-            now={now}
-            onEdit={() => onEditTask(t)}
-            onDelete={() => onDeleteTask(t.id)}
-            onToggle={() => onToggleComplete(t, currentPeriodKeyFor(t, now))}
-          />
-        ))}
+        {oneOffTasks.map(renderRow)}
 
         <div className="section-title" style={{ marginTop: 18 }}>
           <span><Repeat size={12} /> Repeating</span>
@@ -1372,19 +1471,7 @@ function Sidebar({
 
         {repeatingTasks.length === 0 && <div className="empty-hint">No repeating tasks yet.</div>}
 
-        {repeatingTasks.map(t => (
-          <TaskRow
-            key={t.id} task={t}
-            dependsOnTask={t.dependsOn ? tasksById[t.dependsOn] : null}
-            isOverdue={overdueIds.includes(t.id)}
-            isUnscheduled={unscheduledIds.includes(t.id)}
-            completedOccurrences={completedOccurrences}
-            now={now}
-            onEdit={() => onEditTask(t)}
-            onDelete={() => onDeleteTask(t.id)}
-            onToggle={() => onToggleComplete(t, currentPeriodKeyFor(t, now))}
-          />
-        ))}
+        {repeatingTasks.map(renderRow)}
 
         <div className="section-title" style={{ marginTop: 18 }}>
           <span>Blocked time</span>
@@ -1408,39 +1495,71 @@ function Sidebar({
   );
 }
 
-function TaskRow({ task, dependsOnTask, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, completedOccurrences, now }) {
+function TaskRow({
+  task, dependsOnTask, isOverdue, isUnscheduled, onEdit, onDelete, onToggle, completedOccurrences, now,
+  progressPercent = 0, expanded, onToggleExpand, onSetProgress,
+}) {
   const cat = CATEGORY_META[task.category];
   const pri = PRIORITY_META[task.priority];
   const Icon = cat.icon;
   const isRepeating = task.repeat && task.repeat !== "none";
   const currentKey = isRepeating ? currentPeriodKeyFor(task, now) : null;
   const isDone = isRepeating ? (completedOccurrences || []).includes(currentKey) : task.completed;
+  const remainingMinutes = Math.max(0, Math.round(task.duration * (1 - progressPercent / 100)));
   return (
-    <div className={`task-row ${isDone ? "task-row-done" : ""}`}>
-      <button className="check-btn" onClick={onToggle} style={{ "--pc": pri.color }}>
-        {isDone && <Check size={12} />}
-      </button>
-      <div className="task-info" onClick={onEdit}>
-        <div className="task-name">{task.name}</div>
-        <div className="task-meta">
-          <span className="meta-chip" style={{ color: cat.accent }}><Icon size={11} /> {cat.label}</span>
-          <span className="meta-chip"><Clock size={11} /> {formatDuration(task.duration)}</span>
-          {isRepeating && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
-          {isRepeating && repeatDueLabel(task) && <span className="meta-chip">{repeatDueLabel(task)}</span>}
-          {isRepeating && isDone && <span className="meta-chip">Done for now{task.repeat === "daily" ? " — back tomorrow" : task.repeat === "weekly" ? " — back next week" : " — back next month"}</span>}
-          {!isRepeating && task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
-          {isOverdue && <span className="meta-chip meta-warn"><AlertTriangle size={11} /> At risk</span>}
-          {isUnscheduled && <span className="meta-chip meta-danger"><AlertTriangle size={11} /> Won't fit</span>}
-          {dependsOnTask && (
-            <span className="meta-chip meta-dep" title={`Won't be scheduled before "${dependsOnTask.name}"`}>
-              <Link2 size={11} /> After {dependsOnTask.name}
+    <div className="task-row-wrap">
+      <div className={`task-row ${isDone ? "task-row-done" : ""}`}>
+        <button className="check-btn" onClick={onToggle} style={{ "--pc": pri.color }}>
+          {isDone && <Check size={12} />}
+        </button>
+        <div className="task-info" onClick={onEdit}>
+          <div className="task-name">{task.name}</div>
+          <div className="task-meta">
+            <span className="meta-chip" style={{ color: cat.accent }}><Icon size={11} /> {cat.label}</span>
+            <span className="meta-chip">
+              <Clock size={11} /> {progressPercent > 0 && !isDone ? `${formatDuration(remainingMinutes)} left` : formatDuration(task.duration)}
             </span>
-          )}
+            {progressPercent > 0 && !isDone && <span className="meta-chip meta-progress">{progressPercent}% done</span>}
+            {isRepeating && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
+            {isRepeating && repeatDueLabel(task) && <span className="meta-chip">{repeatDueLabel(task)}</span>}
+            {isRepeating && isDone && <span className="meta-chip">Done for now{task.repeat === "daily" ? " — back tomorrow" : task.repeat === "weekly" ? " — back next week" : " — back next month"}</span>}
+            {!isRepeating && task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>}
+            {isOverdue && <span className="meta-chip meta-warn"><AlertTriangle size={11} /> At risk</span>}
+            {isUnscheduled && <span className="meta-chip meta-danger"><AlertTriangle size={11} /> Won't fit</span>}
+            {dependsOnTask && (
+              <span className="meta-chip meta-dep" title={`Won't be scheduled before "${dependsOnTask.name}"`}>
+                <Link2 size={11} /> After {dependsOnTask.name}
+              </span>
+            )}
+          </div>
         </div>
+        {task.color && <span className="color-dot" style={{ background: task.color }} title="Custom color" />}
+        <span className="pri-dot" style={{ background: pri.color }} title={pri.label} />
+        {!isDone && (
+          <button
+            className={`icon-btn small ghost ${expanded ? "icon-btn-active" : ""}`}
+            onClick={(e) => { e.stopPropagation(); onToggleExpand(); }}
+            title="Adjust progress"
+          >
+            <Percent size={12} />
+          </button>
+        )}
+        <button className="icon-btn small ghost" onClick={onDelete}><Trash2 size={12} /></button>
       </div>
-      {task.color && <span className="color-dot" style={{ background: task.color }} title="Custom color" />}
-      <span className="pri-dot" style={{ background: pri.color }} title={pri.label} />
-      <button className="icon-btn small ghost" onClick={onDelete}><Trash2 size={12} /></button>
+      {expanded && !isDone && (
+        <div className="progress-panel" onClick={e => e.stopPropagation()}>
+          <input
+            type="range" min={0} max={100} step={5} value={progressPercent}
+            onChange={e => onSetProgress(Number(e.target.value))}
+            className="progress-slider"
+            style={{ "--pct": `${progressPercent}%` }}
+          />
+          <div className="progress-panel-label">
+            {progressPercent}% complete — {formatDuration(remainingMinutes)} remaining
+            {progressPercent >= 95 && <span className="text-faint"> (drag to 100% to mark it done)</span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1779,14 +1898,35 @@ function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
       : today.getDate()
   );
 
+  // "split into parts" — only offered when creating a brand-new task; each
+  // part becomes its own task, chained by dependsOn (part 2 depends on part
+  // 1, etc.), so they naturally schedule in order via the dependency engine.
+  const [splitEnabled, setSplitEnabled] = useState(false);
+  const [splitMode, setSplitMode] = useState("count"); // "count" | "length"
+  const [splitCount, setSplitCount] = useState(2);
+  const [splitMaxLen, setSplitMaxLen] = useState(45);
+  const splitParts = splitEnabled
+    ? computeSplitDurations(Number(duration) || 0, splitMode, splitMode === "count" ? splitCount : splitMaxLen)
+    : [];
+
   function submit() {
     if (!name.trim()) return;
     let repeatDueRule = null;
     if (repeat === "weekly" && hasRepeatDue) repeatDueRule = repeatDueWeekday;
     if (repeat === "monthly" && hasRepeatDue) repeatDueRule = repeatDueLastDay ? -1 : (Number(repeatDueDay) || 1);
+    const resolvedDueDate = hasDue && dueDate ? new Date(dueDate + "T23:59:00").toISOString() : null;
+
+    if (!initial && splitEnabled && splitParts.length > 1) {
+      onSave({
+        __split: true, baseName: name.trim(), category, priority, color,
+        dueDate: resolvedDueDate, repeat, repeatDueRule, parts: splitParts,
+      });
+      return;
+    }
+
     onSave({
       name: name.trim(), category, priority, duration: Number(duration) || 15, color,
-      dueDate: hasDue && dueDate ? new Date(dueDate + "T23:59:00").toISOString() : null,
+      dueDate: resolvedDueDate,
       repeat, repeatDueRule, dependsOn: dependsOn || null,
     });
   }
@@ -1820,6 +1960,43 @@ function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
         <span className="unit-label">minutes</span>
       </div>
 
+      {!initial && (
+        <>
+          <label className="field-label row-inline" style={{ justifyContent: "space-between" }}>
+            <span>Split into parts</span>
+            <input type="checkbox" checked={splitEnabled} onChange={e => setSplitEnabled(e.target.checked)} />
+          </label>
+          {splitEnabled && (
+            <>
+              <div className="segmented">
+                <button type="button" className={`segment ${splitMode === "count" ? "segment-active" : ""}`} style={{ "--c": CATEGORY_META[category].accent }} onClick={() => setSplitMode("count")}>
+                  By number of parts
+                </button>
+                <button type="button" className={`segment ${splitMode === "length" ? "segment-active" : ""}`} style={{ "--c": CATEGORY_META[category].accent }} onClick={() => setSplitMode("length")}>
+                  By max segment length
+                </button>
+              </div>
+              {splitMode === "count" ? (
+                <div className="row-inline">
+                  <input className="text-input small" type="number" min={2} max={20} value={splitCount} onChange={e => setSplitCount(e.target.value)} />
+                  <span className="unit-label">parts</span>
+                </div>
+              ) : (
+                <div className="row-inline">
+                  <input className="text-input small" type="number" min={5} step={5} value={splitMaxLen} onChange={e => setSplitMaxLen(e.target.value)} />
+                  <span className="unit-label">minutes max per part</span>
+                </div>
+              )}
+              <div className="hint-text">
+                {splitParts.length > 1
+                  ? `Will create ${splitParts.length} tasks — "${name.trim() || "Task"} (Part 1)" through "(Part ${splitParts.length})": ${splitParts.map(p => formatDuration(p)).join(", ")}. Each part depends on the one before it, so they'll always schedule in order.`
+                  : "Current settings don't produce more than one part — raise the part count or lower the max segment length."}
+              </div>
+            </>
+          )}
+        </>
+      )}
+
       <label className="field-label">Color</label>
       <ColorPickerField
         color={color} onChange={setColor}
@@ -1828,15 +2005,19 @@ function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
       />
       <div className="hint-text">Sets this task's color on the calendar. Leave unset to use the {category} category's default color.</div>
 
-      <label className="field-label">Depends on</label>
-      <select className="text-input" value={dependsOn} onChange={e => setDependsOn(e.target.value)}>
-        <option value="">None</option>
-        {dependencyOptions.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-      </select>
-      {dependsOnTask && (
-        <div className="hint-text">
-          Won't be scheduled until "{dependsOnTask.name}" {dependsOnTask.repeat && dependsOnTask.repeat !== "none" ? "has run earlier that same day" : "is scheduled earlier"}, or is marked complete.
-        </div>
+      {!(splitEnabled && !initial) && (
+        <>
+          <label className="field-label">Depends on</label>
+          <select className="text-input" value={dependsOn} onChange={e => setDependsOn(e.target.value)}>
+            <option value="">None</option>
+            {dependencyOptions.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+          {dependsOnTask && (
+            <div className="hint-text">
+              Won't be scheduled until "{dependsOnTask.name}" {dependsOnTask.repeat && dependsOnTask.repeat !== "none" ? "has run earlier that same day" : "is scheduled earlier"}, or is marked complete.
+            </div>
+          )}
+        </>
       )}
 
       <label className="field-label">Repeats</label>
@@ -2333,6 +2514,22 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 }
 .task-row:hover{background:var(--surface);}
 .task-row-done .task-name{color:var(--text-faint); text-decoration:line-through;}
+.task-row-wrap{border-radius:10px;}
+.icon-btn-active{background:var(--surface); color:var(--text);}
+.progress-panel{
+  margin:0 6px 8px; padding:10px 12px; background:var(--surface); border:1px solid var(--border); border-radius:10px;
+}
+.progress-slider{
+  width:100%; -webkit-appearance:none; appearance:none; height:6px; border-radius:3px; outline:none; cursor:pointer;
+  background:linear-gradient(to right, var(--accent-blue, #5B8DEF) var(--pct, 0%), var(--border) var(--pct, 0%));
+}
+.progress-slider::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none; width:15px; height:15px; border-radius:50%; background:#fff;
+  border:2px solid #222; cursor:pointer;
+}
+.progress-slider::-moz-range-thumb{width:15px; height:15px; border-radius:50%; background:#fff; border:2px solid #222; cursor:pointer;}
+.progress-panel-label{font-size:11.5px; color:var(--text-dim); margin-top:8px;}
+.meta-progress{color:#6BCB77; border-color:#274a2e;}
 .check-btn{
   width:18px; height:18px; border-radius:6px; border:1.5px solid var(--pc, #555); background:transparent;
   color:var(--pc,#555); display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:2px;
