@@ -558,7 +558,7 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 // sync panel — a quick way to confirm a device is actually running the
 // latest deployed build rather than something stale a service worker or
 // browser cache is still hanging onto.
-const BUILD_TAG = "2026.08.18-19";
+const BUILD_TAG = "2026.08.18-20";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const DRIVE_FILE_NAME = "slate-schedule.json";
 
@@ -686,6 +686,7 @@ export default function App() {
 
   const [weekStartOffset, setWeekStartOffset] = useState(0); // in days
   const [taskModal, setTaskModal] = useState(null); // null | 'new' | task object
+  const [taskModalTab, setTaskModalTab] = useState("edit"); // which tab the task modal opens to — "complete" from calendar clicks, "edit" from the sidebar
   const [hoursModalOpen, setHoursModalOpen] = useState(false);
   const [blockedModal, setBlockedModal] = useState(null); // null | 'new' | event object
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -1208,6 +1209,17 @@ export default function App() {
     return <div className="loading-screen">Loading your week…</div>;
   }
 
+  // derived props for whichever task is currently open in the modal — only
+  // meaningful when taskModal is an actual task (not "new" or null)
+  const taskModalTask = taskModal && taskModal !== "new" ? taskModal : null;
+  const taskModalOccKey = taskModalTask && taskModalTask.repeat && taskModalTask.repeat !== "none" ? currentPeriodKeyFor(taskModalTask, now) : null;
+  const taskModalIsDone = taskModalTask
+    ? (taskModalTask.repeat && taskModalTask.repeat !== "none" ? completedOccurrences.includes(taskModalOccKey) : taskModalTask.completed)
+    : false;
+  const taskModalProgress = taskModalTask
+    ? (taskModalTask.repeat && taskModalTask.repeat !== "none" ? (occurrenceProgress[taskModalOccKey] || 0) : (taskModalTask.progressPercent || 0))
+    : 0;
+
   const sidebarProps = {
     tasks: filteredTasks,
     overdueIds: schedule.overdue,
@@ -1217,7 +1229,7 @@ export default function App() {
     search, setSearch,
     showCompleted, setShowCompleted,
     onAddTask: () => { setTaskModal("new"); setMobileTasksOpen(false); },
-    onEditTask: (t) => { setTaskModal(t); setMobileTasksOpen(false); },
+    onEditTask: (t) => { setTaskModalTab("edit"); setTaskModal(t); setMobileTasksOpen(false); },
     onDeleteTask: deleteTask,
     onToggleComplete: toggleComplete,
     onSetProgress: setTaskProgress,
@@ -1274,7 +1286,7 @@ export default function App() {
           onDropBlock={lockBlockAt}
           onUnlockBlock={unlockBlock}
           onToggleComplete={(taskId, occurrenceKey) => { const t = tasksById[taskId]; if (t) toggleComplete(t, occurrenceKey); }}
-          onEditTask={(taskId) => { const t = tasksById[taskId]; if (t) setTaskModal(t); }}
+          onEditTask={(taskId) => { const t = tasksById[taskId]; if (t) { setTaskModalTab("complete"); setTaskModal(t); } }}
           now={now}
         />
       </div>
@@ -1282,6 +1294,11 @@ export default function App() {
       {taskModal && (
         <TaskModal
           initial={taskModal === "new" ? null : taskModal}
+          initialTab={taskModalTab}
+          isDone={taskModalIsDone}
+          progressPercent={taskModalProgress}
+          onToggleComplete={() => taskModalTask && toggleComplete(taskModalTask, taskModalOccKey)}
+          onSetProgress={(pct) => taskModalTask && setTaskProgress(taskModalTask, taskModalOccKey, pct)}
           recentColors={recentColors}
           allTasks={tasks}
           onClose={() => setTaskModal(null)}
@@ -1867,7 +1884,46 @@ function dependentDescendants(taskId, allTasks) {
   return all;
 }
 
-function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
+/* the default tab when opening a task from a calendar block click — quick
+   actions (mark complete / adjust progress) without navigating into the
+   full edit form. The "Edit" tab (existing full form) is one click away. */
+function TaskCompletionPanel({ task, isDone, progressPercent, onToggleComplete, onSetProgress }) {
+  const cat = CATEGORY_META[task.category];
+  const CatIcon = cat.icon;
+  const remainingMinutes = Math.max(0, Math.round(task.duration * (1 - progressPercent / 100)));
+  return (
+    <>
+      <div className="quick-complete-meta">
+        <span className="meta-chip" style={{ color: cat.accent }}><CatIcon size={11} /> {cat.label}</span>
+        <span className="meta-chip">
+          <Clock size={11} /> {progressPercent > 0 && !isDone ? `${formatDuration(remainingMinutes)} left` : formatDuration(task.duration)}
+        </span>
+        {task.repeat && task.repeat !== "none" && <span className="meta-chip"><Repeat size={11} /> {REPEAT_META[task.repeat].label}</span>}
+        {!task.repeat || task.repeat === "none" ? (task.dueDate && <span className="meta-chip">Due {monthDayLabel(new Date(task.dueDate))}</span>) : null}
+      </div>
+
+      <button className={`mark-complete-btn ${isDone ? "mark-complete-btn-done" : ""}`} onClick={onToggleComplete}>
+        <Check size={16} /> {isDone ? "Completed — tap to undo" : "Mark complete"}
+      </button>
+
+      {!isDone && (
+        <>
+          <label className="field-label" style={{ marginTop: 18 }}>Or adjust progress</label>
+          <input
+            type="range" min={0} max={100} step={5} value={progressPercent}
+            onChange={e => onSetProgress(Number(e.target.value))}
+            className="progress-slider"
+            style={{ "--pct": `${progressPercent}%` }}
+          />
+          <div className="progress-panel-label">{progressPercent}% complete — {formatDuration(remainingMinutes)} remaining</div>
+        </>
+      )}
+    </>
+  );
+}
+
+function TaskModal({ initial, onClose, onSave, recentColors, allTasks, initialTab, isDone, progressPercent = 0, onToggleComplete, onSetProgress }) {
+  const [tab, setTab] = useState(initial ? (initialTab || "edit") : "edit");
   const today = new Date();
   const [name, setName] = useState(initial?.name || "");
   const [category, setCategory] = useState(initial?.category || "work");
@@ -1932,7 +1988,22 @@ function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
   }
 
   return (
-    <ModalShell title={initial ? "Edit task" : "New task"} onClose={onClose}>
+    <ModalShell title={initial ? initial.name : "New task"} onClose={onClose}>
+      {initial && (
+        <div className="modal-tabs">
+          <button className={`modal-tab ${tab === "complete" ? "modal-tab-active" : ""}`} onClick={() => setTab("complete")}>Complete</button>
+          <button className={`modal-tab ${tab === "edit" ? "modal-tab-active" : ""}`} onClick={() => setTab("edit")}>Edit</button>
+        </div>
+      )}
+
+      {initial && tab === "complete" ? (
+        <TaskCompletionPanel
+          task={initial} isDone={isDone} progressPercent={progressPercent}
+          onToggleComplete={() => { onToggleComplete(); onClose(); }}
+          onSetProgress={onSetProgress}
+        />
+      ) : (
+        <>
       <label className="field-label">Task name</label>
       <input className="text-input" autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Draft grant figures" />
 
@@ -2073,6 +2144,8 @@ function TaskModal({ initial, onClose, onSave, recentColors, allTasks }) {
         <button className="secondary-btn" onClick={onClose}>Cancel</button>
         <button className="primary-btn" onClick={submit}>{initial ? "Save changes" : "Add task"}</button>
       </div>
+        </>
+      )}
     </ModalShell>
   );
 }
@@ -2703,6 +2776,24 @@ html, body{height:100%; margin:0; padding:0; overflow:hidden; overscroll-behavio
 }
 .segment-active{color:var(--text); border-color:var(--c); background:color-mix(in srgb, var(--c) 16%, transparent);}
 .modal-actions{display:flex; justify-content:flex-end; gap:8px; margin-top:20px;}
+
+.modal-tabs{display:flex; gap:4px; margin-bottom:18px; border-bottom:1px solid var(--border); padding-bottom:0;}
+.modal-tab{
+  background:none; border:none; color:var(--text-faint); font-size:13px; font-weight:600; padding:8px 4px 10px;
+  cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; transition:color .15s, border-color .15s;
+}
+.modal-tab + .modal-tab{margin-left:12px;}
+.modal-tab:hover{color:var(--text-dim);}
+.modal-tab-active{color:var(--text); border-bottom-color:var(--accent-blue, #5B8DEF);}
+.quick-complete-meta{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:18px;}
+.mark-complete-btn{
+  width:100%; display:flex; align-items:center; justify-content:center; gap:8px; padding:13px; border-radius:10px;
+  border:1px solid #2c4a34; background:color-mix(in srgb, #6BCB77 14%, transparent); color:#8FE39B;
+  font-size:14px; font-weight:600; cursor:pointer; transition:background .15s;
+}
+.mark-complete-btn:hover{background:color-mix(in srgb, #6BCB77 22%, transparent);}
+.mark-complete-btn-done{background:var(--surface); border-color:var(--border); color:var(--text-dim);}
+.mark-complete-btn-done:hover{background:var(--surface-hover);}
 
 .color-field{position:relative;}
 .color-dropdown-btn{
